@@ -132,10 +132,16 @@ async def select_model():
         return FASTLLM_MODEL
     response = await client.models.list()
     model_ids = sorted({item.id for item in response.data})
+    excluded = ("image", "video", "audio", "embedding", "rerank", "moderation", "seedance", "wan3", "hailuo")
+    grok_models = [
+        item for item in model_ids
+        if "grok" in item.lower() and not any(marker in item.lower() for marker in excluded)
+    ]
+    if grok_models:
+        return grok_models[0]
     for preferred in MODEL_PREFERENCES:
         if preferred in model_ids:
             return preferred
-    excluded = ("image", "video", "seedance", "wan3", "hailuo")
     for item in model_ids:
         if not any(marker in item.lower() for marker in excluded):
             return item

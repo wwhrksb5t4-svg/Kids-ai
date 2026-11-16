@@ -5,14 +5,14 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 ## What the bot does
 
 - Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00).
-- Generates short scripts with FastLLM, creates narrated vertical MP4 scene-card videos, and sends each to the configured Telegram admin for review.
+- Generates short scripts with FastLLM, creates narrated vertical MP4 scene-card videos, and sends each to the configured Telegram admin for review. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model, then uses the existing model preference/fallback behavior.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
 - `/today` manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
 - Stores jobs, generated files, and OAuth token in SQLite/files under `DATA_DIR`.
 
 ## Important limitations
 
-This MVP renders narrated text/illustration cards, **not full AI animation or generated scene artwork**. Edge TTS is used for voice. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today` after reviewing the error.
+This MVP renders narrated text/illustration cards, **not full AI animation or generated scene artwork**. Nano Banana image generation is not integrated: it requires an image-generation API supported by the configured provider, which the current text-completion integration does not call. Edge TTS is used for voice. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today` after reviewing the error.
 
 YouTube OAuth needs Google Cloud setup and may require OAuth consent-screen configuration/testing. The Google account must own or manage the target channel. Analytics data availability can lag. Before publishing, the admin must review every video; children's content requires careful manual checks. This software does not guarantee YouTube policy compliance or channel growth.
 
