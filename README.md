@@ -4,7 +4,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 
 ## What the bot does
 
-- Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00).
+- Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00). Each script targets 300-360 spoken words, approximately 2-3 minutes.
 - Generates short scripts with FastLLM, creates narrated vertical MP4 scene-card videos, and sends each to the configured Telegram admin for review.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
 - `/today` manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
