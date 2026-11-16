@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import binascii
+import io
 import json
 import os
 import re
@@ -12,6 +15,7 @@ from typing import Optional
 from urllib.parse import quote
 
 import edge_tts
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -20,7 +24,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from openai import AsyncOpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -47,6 +51,9 @@ DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
 DAILY_TOPIC = (os.getenv("DAILY_TOPIC") or "A gentle, original sea adventure that teaches kindness, teamwork, or caring for nature").strip()
 BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
+IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
+CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
+CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 RENDER_RETRY_AFTER = timedelta(minutes=10)
 
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly", "https://www.googleapis.com/auth/yt-analytics.readonly"]
@@ -155,7 +162,7 @@ def parse_json(text: str):
 
 async def write_story(topic: str, language: str, model: str):
     language_name = "Arabic" if language == "ar" else "English"
-    prompt = f"Write an original gentle sea-adventure cartoon episode for children ages 4-8 in {language_name}. Topic: {topic}. About 90 seconds of spoken narration. Use original characters and avoid copying copyrighted Sinbad adaptations or other franchises. No frightening scenes, violence, or unsafe instructions. Keep character names and events aligned between language versions. Return JSON with title, description, moral, and scenes: 5-7 objects, each having visual_description, narration, sound_effect. Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
+    prompt = f"Write an original gentle sea-adventure cartoon episode for children ages 4-8 in {language_name}. Topic: {topic}. About 90 seconds of spoken narration. Use original characters and avoid copying copyrighted Sinbad adaptations or other franchises. No frightening scenes, violence, or unsafe instructions. Keep character names and events aligned between language versions. Return JSON with title, description, moral, and scenes: 5-7 objects, each having visual_description, narration, sound_effect. Write each visual_description in English, as a self-contained illustration prompt, repeating the appearance and clothing of the characters in every scene. Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
     try:
         response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
         return parse_json(response.choices[0].message.content or "{}")
@@ -210,6 +217,51 @@ def make_frame(scene, path, index, total, language):
     image.save(path)
 
 
+def check_image_provider():
+    if IMAGE_PROVIDER not in ("cards", "cloudflare"):
+        raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
+    if IMAGE_PROVIDER == "cloudflare" and not (
+        re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
+    ):
+        raise RuntimeError("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in Railway for Cloudflare images.")
+
+
+async def make_cloudflare_frame(scene, path):
+    description = scene.get("visual_description", "").strip()
+    if not description:
+        raise RuntimeError("A scene is missing its visual description for image generation.")
+    prompt = (
+        "Original child-friendly storybook illustration, bright colors, gentle and safe, "
+        "no text, no logos, no recognizable copyrighted characters. " + description
+    )[:2048]
+    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+    try:
+        async with httpx.AsyncClient(timeout=120) as http:
+            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json={"prompt": prompt, "num_steps": 4})
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"Cloudflare image generation failed (HTTP {exc.response.status_code}); check credentials and quota.") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Could not reach Cloudflare image generation; try again.") from exc
+    try:
+        payload = response.json()
+        if payload.get("success") is not True:
+            raise RuntimeError("Cloudflare image generation failed; check credentials and quota.")
+        image_bytes = base64.b64decode(payload["result"]["image"], validate=True)
+        if len(image_bytes) > 20 * 1024 * 1024:
+            raise RuntimeError("Cloudflare returned an image that is too large.")
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = ImageOps.fit(image.convert("RGB"), (720, 1280), method=Image.Resampling.LANCZOS)
+    except (ValueError, KeyError, TypeError, binascii.Error, UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise RuntimeError("Cloudflare returned an invalid image response.") from exc
+    temporary = path.with_suffix(".tmp")
+    try:
+        image.save(temporary, format="PNG")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 async def render_video(episode_id: str):
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -217,6 +269,7 @@ async def render_video(episode_id: str):
         raise RuntimeError("Episode not found")
     episode = dict(row)
     scenes = json.loads(episode["scenes"])
+    check_image_provider()
     if not subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0:
         raise RuntimeError("FFmpeg is missing")
     job_dir = WORK_DIR / episode_id
@@ -232,7 +285,12 @@ async def render_video(episode_id: str):
         clip = job_dir / f"clip-{index}.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        make_frame(scene, frame, index, len(scenes), episode["language"])
+        if IMAGE_PROVIDER == "cloudflare":
+            frame = job_dir / f"artwork-{index}.png"
+            if not frame.exists():
+                await make_cloudflare_frame(scene, frame)
+        else:
+            make_frame(scene, frame, index, len(scenes), episode["language"])
         try:
             await asyncio.wait_for(edge_tts.Communicate(scene["narration"], voice).save(str(audio)), timeout=120)
         except asyncio.TimeoutError as exc:
@@ -240,7 +298,11 @@ async def render_video(episode_id: str):
         command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music), "-filter_complex", "[2:a]volume=0.10[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]", "-map", "0:v", "-map", "[aout]"]
-        command += ["-shortest", "-vf", "scale=720:1280,format=yuv420p", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
+        if IMAGE_PROVIDER == "cloudflare":
+            video_filter = "scale=800:1424,zoompan=z='min(zoom+0.00004,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=720x1280:fps=24,format=yuv420p"
+        else:
+            video_filter = "scale=720:1280,format=yuv420p"
+        command += ["-shortest", "-vf", video_filter, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
         result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=240)
         if result.returncode:
             raise RuntimeError(f"FFmpeg failed: {result.stderr[-700:]}")
@@ -353,7 +415,10 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
-    await update.message.reply_text("أهلًا بك في Kids Haven Studio.\n/connect — ربط قناة YouTube\n/today — إنشاء النسختين الآن\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nسيتم إنشاء فيديو عربي وآخر إنجليزي يوميًا. كل فيديو يحتاج موافقتك قبل النشر العام.")
+    await update.message.reply_text(
+        "أهلًا بك في Kids Haven Studio.\n/connect — ربط قناة YouTube\n/today — إنشاء النسختين الآن\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nسيتم إنشاء فيديو عربي وآخر إنجليزي يوميًا. كل فيديو يحتاج موافقتك قبل النشر العام.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 إنشاء حلقتَي اليوم", callback_data="generate:today")]]),
+    )
 
 
 async def tg_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,7 +441,11 @@ async def tg_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not admin_only(update):
         await update.message.reply_text("غير مصرح.")
         return
-    await update.message.reply_text("بدأ إنشاء حلقتين. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
+    await create_today(update.message)
+
+
+async def create_today(message):
+    await message.reply_text("بدأ إنشاء حلقتين. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
     today = utc_now().date()
     for language in ("ar", "en"):
         try:
@@ -384,7 +453,7 @@ async def tg_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if row.get("status") in ("pending_review", "ready_for_review"):
                 await send_episode_for_review(row["id"])
         except Exception as exc:
-            await update.message.reply_text(f"فشل إنشاء {'العربية' if language=='ar' else 'English'}: {str(exc)[:700]}")
+            await message.reply_text(f"فشل إنشاء {'العربية' if language=='ar' else 'English'}: {str(exc)[:700]}")
 
 
 async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,6 +503,9 @@ async def tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("غير مصرح", show_alert=True)
         return
     await query.answer()
+    if query.data == "generate:today":
+        await create_today(query.message)
+        return
     action, episode_id = query.data.split(":", 1)
     if action == "reject":
         with db() as con:
