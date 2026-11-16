@@ -8,6 +8,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 - Generates short scripts with FastLLM, creates narrated vertical MP4 scene-card videos, and sends each to the configured Telegram admin for review.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
 - `/today` manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
+- `/status` includes render progress and the latest render error. `/today` retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
 - Stores jobs, generated files, and OAuth token in SQLite/files under `DATA_DIR`.
 
 ## Important limitations
