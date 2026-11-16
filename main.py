@@ -77,8 +77,10 @@ def init_db():
             analytics TEXT, UNIQUE(episode_date, language)
         )""")
         con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
-            state TEXT PRIMARY KEY, created_at TEXT NOT NULL
+            state TEXT PRIMARY KEY, created_at TEXT NOT NULL, code_verifier TEXT
         )""")
+        if "code_verifier" not in [r[1] for r in con.execute("PRAGMA table_info(oauth_states)")]:
+            con.execute("ALTER TABLE oauth_states ADD COLUMN code_verifier TEXT")
         con.execute("CREATE TABLE IF NOT EXISTS daily_runs (run_date TEXT NOT NULL, language TEXT NOT NULL, status TEXT NOT NULL, error TEXT, PRIMARY KEY(run_date,language))")
 
 
@@ -339,7 +341,7 @@ async def tg_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flow = Flow.from_client_config(config, scopes=YOUTUBE_SCOPES, state=state, redirect_uri=GOOGLE_REDIRECT_URI)
         authorization_url, _ = flow.authorization_url(access_type="offline", include_granted_scopes="true", prompt="consent")
         with db() as con:
-            con.execute("INSERT INTO oauth_states(state,created_at) VALUES(?,?)", (state, utc_now().isoformat()))
+            con.execute("INSERT INTO oauth_states(state,created_at,code_verifier) VALUES(?,?,?)", (state, utc_now().isoformat(), flow.code_verifier))
         await update.message.reply_text("افتح رابط Google التالي وسجّل الدخول بالحساب المالك للقناة. وافق على صلاحيات YouTube للرفع والتحليلات. لا ترسل رمز الدخول لأحد:\n" + authorization_url)
     except Exception as exc:
         await update.message.reply_text(f"تعذر بدء الربط: {exc}")
@@ -491,7 +493,7 @@ async def health():
 @app.get("/youtube/oauth/callback")
 async def youtube_oauth_callback(request: Request, state: str, code: str):
     with db() as con:
-        saved = con.execute("SELECT created_at FROM oauth_states WHERE state=?", (state,)).fetchone()
+        saved = con.execute("SELECT created_at, code_verifier FROM oauth_states WHERE state=?", (state,)).fetchone()
         if saved:
             con.execute("DELETE FROM oauth_states WHERE state=?", (state,))
     if not saved:
@@ -501,7 +503,7 @@ async def youtube_oauth_callback(request: Request, state: str, code: str):
         raise HTTPException(400, "OAuth state expired. Start again with Telegram /connect.")
     try:
         flow = Flow.from_client_config(google_client_config(), scopes=YOUTUBE_SCOPES, state=state, redirect_uri=GOOGLE_REDIRECT_URI)
-        flow.fetch_token(code=code)
+        flow.fetch_token(code=code, code_verifier=saved["code_verifier"])
         TOKEN_PATH.write_text(flow.credentials.to_json(), encoding="utf-8")
         TOKEN_PATH.chmod(0o600)
     except Exception as exc:
