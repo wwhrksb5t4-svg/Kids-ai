@@ -5,15 +5,15 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 ## What the bot does
 
 - Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00).
-- Generates short scripts with FastLLM, creates narrated vertical MP4 scene-card videos, and sends each to the configured Telegram admin for review.
+- Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
-- `/today` manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
+- The button shown by `/start`, or `/today`, manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
 - `/status` includes render progress and the latest render error. `/today` retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
 - Stores jobs, generated files, and OAuth token in SQLite/files under `DATA_DIR`.
 
 ## Important limitations
 
-This MVP renders narrated text/illustration cards, **not full AI animation or generated scene artwork**. Edge TTS is used for voice. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today` after reviewing the error.
+By default the renderer uses text cards. Cloudflare mode generates still images with a slow zoom, **not fully animated characters or songs**. Images can be inconsistent or unsuitable, so review every video before approval. Edge TTS is used for voice. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today` after reviewing the error.
 
 YouTube OAuth needs Google Cloud setup and may require OAuth consent-screen configuration/testing. The Google account must own or manage the target channel. Analytics data availability can lag. Before publishing, the admin must review every video; children's content requires careful manual checks. This software does not guarantee YouTube policy compliance or channel growth.
 
@@ -39,7 +39,16 @@ DAILY_TOPIC=Original gentle sea adventures teaching kindness and teamwork
 
 Optional: `BACKGROUND_MUSIC_PATH=/app/data/music/licensed-track.mp3` for music you have rights to use. Without this variable, the video has narration only.
 
-Add a Railway Volume mounted at `/app/data` so the SQLite database, media, and Google token survive redeployments. The included `nixpacks.toml` installs FFmpeg. Use exactly one running replica because Telegram polling and the in-process scheduler must not run twice. `PUBLIC_BASE_URL` must be the full HTTPS Railway domain.
+### AI scene illustrations
+
+1. Create a Cloudflare account and set up Workers AI. In its [REST API setup](https://developers.cloudflare.com/workers-ai/get-started/rest-api/), find the Account ID and create a Workers AI API token with the required permission.
+2. In the Railway service's Variables, set `IMAGE_PROVIDER=cloudflare`, `CLOUDFLARE_ACCOUNT_ID` to the Account ID, and `CLOUDFLARE_API_TOKEN` to the token. Never share or commit the token.
+3. Deploy the changes, then use `/today`. Each scene requests one image with `@cf/black-forest-labs/flux-1-schnell`; completed images are reused when a render is retried. Existing completed videos are not regenerated.
+4. Review the images, narration and music rights in Telegram before publishing. The model generates independent images, so characters may look different across scenes. Video generation does not create music or singing.
+
+Cloudflare's [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) describes a shared daily free allocation; usage and limits can change. On the Free plan, exceeding it stops requests; Paid plan usage above the free allocation can incur charges. FastLLM and Railway costs are separate. A missing credential, exhausted quota, or image-generation error fails the render visibly instead of silently publishing text cards. Use `IMAGE_PROVIDER=cards` to retain the original renderer.
+
+Add a Railway Volume mounted at `/app/data` so the SQLite database, media, and Google token survive redeployments. The included Dockerfile installs FFmpeg. Use exactly one running replica because Telegram polling and the in-process scheduler must not run twice. `PUBLIC_BASE_URL` must be the full HTTPS Railway domain.
 
 ### Telegram bot
 
