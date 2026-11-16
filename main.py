@@ -47,6 +47,7 @@ DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
 DAILY_TOPIC = (os.getenv("DAILY_TOPIC") or "A gentle, original sea adventure that teaches kindness, teamwork, or caring for nature").strip()
 BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
+RENDER_RETRY_AFTER = timedelta(minutes=10)
 
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly", "https://www.googleapis.com/auth/yt-analytics.readonly"]
 MODEL_PREFERENCES = ("gpt-5.6", "gpt-5.6-sol", "claude-sonnet-4-6", "gemini-3.8-flash", "deepseek-v4-flash", "qwen3.7-max", "kimi-k2.8")
@@ -229,8 +230,13 @@ async def render_video(episode_id: str):
         frame = job_dir / f"scene-{index}.png"
         audio = job_dir / f"voice-{index}.mp3"
         clip = job_dir / f"clip-{index}.mp4"
+        with db() as con:
+            con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
         make_frame(scene, frame, index, len(scenes), episode["language"])
-        await edge_tts.Communicate(scene["narration"], voice).save(str(audio))
+        try:
+            await asyncio.wait_for(edge_tts.Communicate(scene["narration"], voice).save(str(audio)), timeout=120)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Voice generation timed out on scene {index+1}/{len(scenes)}") from exc
         command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music), "-filter_complex", "[2:a]volume=0.10[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]", "-map", "0:v", "-map", "[aout]"]
@@ -258,25 +264,42 @@ def telegram_keyboard(episode_id):
 
 async def create_daily_episode(language: str, run_date: date):
     run_key = run_date.isoformat()
+    episode_id = None
     with db() as con:
-        existing = con.execute("SELECT id FROM episodes WHERE episode_date=? AND language=?", (run_key, language)).fetchone()
+        existing = con.execute("SELECT * FROM episodes WHERE episode_date=? AND language=?", (run_key, language)).fetchone()
         if existing:
-            return dict(con.execute("SELECT * FROM episodes WHERE id=?", (existing["id"],)).fetchone())
-        con.execute("INSERT OR REPLACE INTO daily_runs(run_date,language,status,error) VALUES(?,?,?,NULL)", (run_key, language, "generating"))
+            episode = dict(existing)
+            updated_at = datetime.fromisoformat(episode["updated_at"])
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            retry = episode["status"] == "failed" or (
+                episode["status"] == "rendering" and utc_now() - updated_at > RENDER_RETRY_AFTER
+            )
+            if not retry or not episode["scenes"]:
+                return episode
+            episode_id = episode["id"]
+            con.execute(
+                "UPDATE episodes SET status='rendering',render_progress=0,render_error=NULL,updated_at=? WHERE id=?",
+                (utc_now().isoformat(), episode_id),
+            )
+            con.execute("INSERT OR REPLACE INTO daily_runs(run_date,language,status,error) VALUES(?,?,?,NULL)", (run_key, language, "rendering"))
+        else:
+            con.execute("INSERT OR REPLACE INTO daily_runs(run_date,language,status,error) VALUES(?,?,?,NULL)", (run_key, language, "generating"))
     try:
-        model = await select_model()
-        story = await write_story(DAILY_TOPIC, language, model)
-        raw_scenes = story.get("scenes")
-        if not isinstance(raw_scenes, list):
-            raise RuntimeError("The AI did not return scenes")
-        scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves"))} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
-        if not scenes:
-            raise RuntimeError("The AI returned empty narration")
-        episode_id = str(uuid.uuid4())
-        timestamp = utc_now().isoformat()
-        with db() as con:
-            con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, DAILY_TOPIC, str(story.get("title") or DAILY_TOPIC)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model))
-            con.execute("UPDATE daily_runs SET status='rendering' WHERE run_date=? AND language=?", (run_key, language))
+        if episode_id is None:
+            model = await select_model()
+            story = await write_story(DAILY_TOPIC, language, model)
+            raw_scenes = story.get("scenes")
+            if not isinstance(raw_scenes, list):
+                raise RuntimeError("The AI did not return scenes")
+            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves"))} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
+            if not scenes:
+                raise RuntimeError("The AI returned empty narration")
+            episode_id = str(uuid.uuid4())
+            timestamp = utc_now().isoformat()
+            with db() as con:
+                con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, DAILY_TOPIC, str(story.get("title") or DAILY_TOPIC)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model))
+                con.execute("UPDATE daily_runs SET status='rendering' WHERE run_date=? AND language=?", (run_key, language))
         await render_video(episode_id)
         with db() as con:
             con.execute("UPDATE episodes SET status='pending_review' WHERE id=?", (episode_id,))
@@ -286,6 +309,8 @@ async def create_daily_episode(language: str, run_date: date):
         return dict(con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone())
     except Exception as exc:
         with db() as con:
+            if episode_id:
+                con.execute("UPDATE episodes SET status='failed',render_error=?,updated_at=? WHERE id=?", (str(exc)[:1000], utc_now().isoformat(), episode_id))
             con.execute("UPDATE daily_runs SET status='failed',error=? WHERE run_date=? AND language=?", (str(exc)[:1000], run_key, language))
         raise
 
@@ -367,8 +392,15 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح.")
         return
     with db() as con:
-        rows = con.execute("SELECT episode_date,language,status,title,youtube_url FROM episodes ORDER BY created_at DESC LIMIT 10").fetchall()
-    lines = [f"{'🇸🇦' if r['language']=='ar' else '🇬🇧'} {r['episode_date']} · {r['status']} · {r['title']}" + (f"\n{r['youtube_url']}" if r['youtube_url'] else "") for r in rows]
+        rows = con.execute("SELECT episode_date,language,status,title,youtube_url,render_progress,render_error FROM episodes ORDER BY created_at DESC LIMIT 10").fetchall()
+    lines = [
+        f"{'🇸🇦' if r['language']=='ar' else '🇬🇧'} {r['episode_date']} · {r['status']}"
+        + (f" ({r['render_progress']}%)" if r['status'] == "rendering" else "")
+        + f" · {r['title']}"
+        + (f"\nالخطأ: {r['render_error'][:250]}" if r['status'] == "failed" and r['render_error'] else "")
+        + (f"\n{r['youtube_url']}" if r['youtube_url'] else "")
+        for r in rows
+    ]
     await update.message.reply_text("\n".join(lines) if lines else "لا توجد حلقات بعد.")
 
 
