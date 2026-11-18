@@ -5,7 +5,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 ## What the bot does
 
 - Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00).
-- Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom.
+- Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
 - The button shown by `/start`, or `/today`, manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
 - `/status` includes render progress and the latest render error. `/today` retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
