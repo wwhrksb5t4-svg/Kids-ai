@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import io
 import json
 import os
@@ -122,6 +123,90 @@ class StudioHelpersTest(unittest.TestCase):
             self.assertEqual(len(captions), 2)
             self.assertAlmostEqual(captions[-1][2], 10)
             self.assertTrue(all(path.exists() for path, _, _ in captions))
+
+
+class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_prepares_next_scene_while_rendering_in_order(self):
+        started = asyncio.Event()
+        events = []
+
+        async def prepare(index, scene):
+            events.append(f"prepare-{index}")
+            if index == 1:
+                started.set()
+            return scene
+
+        async def render(index, scene, prepared):
+            if index == 0:
+                await asyncio.wait_for(started.wait(), 1)
+            events.append(f"render-{index}")
+            return prepared
+
+        clips = await main.pipeline_scenes(["first", "second"], prepare, render)
+        self.assertEqual(clips, ["first", "second"])
+        self.assertLess(events.index("prepare-1"), events.index("render-0"))
+        self.assertLess(events.index("render-0"), events.index("render-1"))
+
+    async def test_cancels_prefetch_when_render_fails(self):
+        started, stopped = asyncio.Event(), asyncio.Event()
+
+        async def prepare(index, scene):
+            if index:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+            return scene
+
+        async def render(index, scene, prepared):
+            await asyncio.wait_for(started.wait(), 1)
+            raise RuntimeError("render failed")
+
+        with self.assertRaisesRegex(RuntimeError, "render failed"):
+            await main.pipeline_scenes(["first", "second"], prepare, render)
+        self.assertTrue(stopped.is_set())
+
+    async def test_preparation_failure_stops_before_rendering_that_scene(self):
+        rendered = []
+
+        async def prepare(index, scene):
+            if index == 1:
+                raise RuntimeError("image failed")
+            return scene
+
+        async def render(index, scene, prepared):
+            rendered.append(index)
+            return prepared
+
+        with self.assertRaisesRegex(RuntimeError, "image failed"):
+            await main.pipeline_scenes(["first", "second"], prepare, render)
+        self.assertEqual(rendered, [0])
+
+    async def test_image_and_voice_are_prepared_together(self):
+        image_started, voice_started = asyncio.Event(), asyncio.Event()
+
+        async def image(scene, path):
+            image_started.set()
+            await asyncio.wait_for(voice_started.wait(), 1)
+
+        class Voice:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def save(self, path):
+                voice_started.set()
+                await asyncio.wait_for(image_started.wait(), 1)
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
+             patch.object(main, "make_cloudflare_frame", side_effect=image), \
+             patch.object(main.edge_tts, "Communicate", Voice):
+            frame, audio = await main.prepare_scene(
+                {"narration": "hello"}, 0, 1, "en", "voice", Path(directory)
+            )
+        self.assertEqual(frame.name, "artwork-0.png")
+        self.assertEqual(audio.name, "voice-0.mp3")
 
 
 class DashboardTest(unittest.IsolatedAsyncioTestCase):
