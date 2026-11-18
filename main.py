@@ -169,15 +169,27 @@ def parse_json(text: str):
 
 async def write_story(topic: str, language: str, model: str):
     language_name = "Arabic" if language == "ar" else "English"
-    prompt = f"Write an original gentle sea-adventure cartoon episode for children ages 4-8 in {language_name}. Topic: {topic}. About 90 seconds of spoken narration. Use original characters and avoid copying copyrighted Sinbad adaptations or other franchises. No frightening scenes, violence, or unsafe instructions. Keep character names and events aligned between language versions. Return JSON with title, description, moral, and scenes: 5-7 objects, each having visual_description, narration, sound_effect. Write each visual_description in English, as a self-contained illustration prompt, repeating the appearance and clothing of the characters in every scene. Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
-    try:
-        response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
-        return parse_json(response.choices[0].message.content or "{}")
-    except Exception as exc:
-        if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
-            raise
-        response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Return valid JSON only. Create original safe children's stories."}, {"role": "user", "content": prompt}])
-        return parse_json(response.choices[0].message.content or "{}")
+    min_words, max_words = 300, 360
+    prompt = f"Write an original gentle sea-adventure cartoon episode for children ages 4-8 in {language_name}. Topic: {topic}. The combined spoken narration must contain {min_words}-{max_words} words so the finished narrated video lasts about 2-3 minutes. Use original characters and avoid copying copyrighted Sinbad adaptations or other franchises. No frightening scenes, violence, or unsafe instructions. Keep character names and events aligned between language versions. Return JSON with title, description, moral, and scenes: 5-7 objects, each having visual_description, narration, sound_effect. Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
+    for attempt in range(3):
+        try:
+            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
+        except Exception as exc:
+            if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
+                raise
+            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Return valid JSON only. Create original safe children's stories."}, {"role": "user", "content": prompt}])
+        story = parse_json(response.choices[0].message.content or "{}")
+        scenes = story.get("scenes")
+        narration = " ".join(
+            str(scene.get("narration", ""))
+            for scene in scenes
+            if isinstance(scene, dict)
+        ) if isinstance(scenes, list) else ""
+        word_count = len(re.findall(r"\S+", narration))
+        if min_words <= word_count <= max_words:
+            return story
+        prompt += f"\nThe previous attempt had {word_count} spoken words. Regenerate it with {min_words}-{max_words} spoken words total."
+    raise RuntimeError(f"AI could not create a 2-3 minute story after 3 attempts (target: {min_words}-{max_words} spoken words).")
 
 
 def font(size):
