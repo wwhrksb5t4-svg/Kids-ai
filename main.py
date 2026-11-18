@@ -278,6 +278,35 @@ async def make_cloudflare_frame(scene, path):
         temporary.unlink(missing_ok=True)
 
 
+def make_sparkle(path):
+    size = 48
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((4, 4, size - 4, size - 4), fill=(255, 255, 255, 110), outline=(255, 255, 255, 200), width=2)
+    draw.ellipse((12, 12, 22, 22), fill=(255, 255, 255, 220))
+    image.save(path)
+
+
+def animated_video_filter(index, sparkle_input):
+    # Alternate zoom-in / zoom-out per scene, with gentle sway, drifting bubbles and a fade-in.
+    zoom = "min(1.10+0.0007*on,1.22)" if index % 2 == 0 else "max(1.22-0.0007*on,1.10)"
+    graph = [
+        "[0:v]scale=1080:1920,zoompan=z='%s':x='iw/2-(iw/zoom/2)+30*sin(on/20)':y='ih/2-(ih/zoom/2)+20*cos(on/27)':d=1:s=720x1280:fps=24,format=yuv420p[base]" % zoom,
+        "[%d:v]format=rgba,split=6%s" % (sparkle_input, "".join(f"[s{i}]" for i in range(6))),
+    ]
+    previous = "base"
+    for i in range(6):
+        x = 40 + i * 115
+        speed = 45 + (i % 3) * 20
+        offset = i * 210
+        graph.append(
+            f"[{previous}][s{i}]overlay=x='{x}+25*sin(t*1.4+{i})':y='H-mod(t*{speed}+{offset},H+60)':format=auto[o{i}]"
+        )
+        previous = f"o{i}"
+    graph.append(f"[{previous}]fade=t=in:st=0:d=0.3[vout]")
+    return ";".join(graph)
+
+
 async def render_video(episode_id: str):
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -313,12 +342,25 @@ async def render_video(episode_id: str):
             raise RuntimeError(f"Voice generation timed out on scene {index+1}/{len(scenes)}") from exc
         command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
-            command += ["-stream_loop", "-1", "-i", str(music), "-filter_complex", "[2:a]volume=0.10[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]", "-map", "0:v", "-map", "[aout]"]
+            command += ["-stream_loop", "-1", "-i", str(music)]
         if IMAGE_PROVIDER == "cloudflare":
-            video_filter = "scale=800:1424,zoompan=z='min(zoom+0.00004,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=720x1280:fps=24,format=yuv420p"
+            sparkle = job_dir / "sparkle.png"
+            if not sparkle.exists():
+                make_sparkle(sparkle)
+            command += ["-loop", "1", "-framerate", "24", "-i", str(sparkle)]
+            sparkle_input = 3 if music else 2
+            filters = [animated_video_filter(index, sparkle_input)]
+            video_map = "[vout]"
         else:
-            video_filter = "scale=720:1280,format=yuv420p"
-        command += ["-shortest", "-vf", video_filter, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
+            filters = ["[0:v]scale=720:1280,format=yuv420p[vout]"]
+            video_map = "[vout]"
+        if music:
+            filters.append("[2:a]volume=0.10[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]")
+            audio_map = "[aout]"
+        else:
+            audio_map = "1:a"
+        command += ["-filter_complex", ";".join(filters), "-map", video_map, "-map", audio_map,
+                    "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
         result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=240)
         if result.returncode:
             raise RuntimeError(f"FFmpeg failed: {result.stderr[-700:]}")
