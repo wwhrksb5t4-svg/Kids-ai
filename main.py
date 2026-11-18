@@ -226,6 +226,22 @@ def check_image_provider():
         raise RuntimeError("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in Railway for Cloudflare images.")
 
 
+def cloudflare_error(response):
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    errors = body.get("errors") if isinstance(body, dict) else None
+    codes = []
+    if isinstance(errors, list):
+        for error in errors[:5]:
+            code = error.get("code") if isinstance(error, dict) else None
+            if type(code) is int and 0 <= code <= 99999999:
+                codes.append(str(code))
+    detail = f"; Cloudflare error code: {', '.join(codes)}" if codes else "; no Cloudflare error code returned"
+    return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
+
+
 async def make_cloudflare_frame(scene, path):
     description = scene.get("visual_description", "").strip()
     if not description:
@@ -240,13 +256,13 @@ async def make_cloudflare_frame(scene, path):
             response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json={"prompt": prompt, "num_steps": 4})
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"Cloudflare image generation failed (HTTP {exc.response.status_code}); check credentials and quota.") from exc
+        raise RuntimeError(cloudflare_error(exc.response)) from exc
     except httpx.RequestError as exc:
         raise RuntimeError("Could not reach Cloudflare image generation; try again.") from exc
     try:
         payload = response.json()
         if payload.get("success") is not True:
-            raise RuntimeError("Cloudflare image generation failed; check credentials and quota.")
+            raise RuntimeError(cloudflare_error(response))
         image_bytes = base64.b64decode(payload["result"]["image"], validate=True)
         if len(image_bytes) > 20 * 1024 * 1024:
             raise RuntimeError("Cloudflare returned an image that is too large.")
