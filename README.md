@@ -90,7 +90,7 @@ Open `/dashboard` on your Railway domain and enter `APP_API_KEY` to see settings
 ## Studio features
 
 - **Varied topics:** without `DAILY_TOPIC`, themes rotate daily (sea, forest, space, farm, ...) and the prompt avoids recent titles. **Remove `DAILY_TOPIC` from Railway** if you want rotation.
-- **Consistent characters:** the AI writes a character sheet and art style that is prepended to every image prompt, with one seed per episode.
+- **Consistent characters:** the AI writes a character sheet and art style that is prepended to every image prompt. Images may still vary between scenes.
 - **Animated subtitles** (Cloudflare mode) and an **original synthesized lullaby** under the narration (override with `BACKGROUND_MUSIC_PATH`).
 - **Voice:** `VOICE_AR`, `VOICE_EN`, `VOICE_RATE` (default `-5%`), `VOICE_PITCH` (default `+0Hz`).
 - **Dashboard** at `/dashboard` has a "generate now" button (`POST /studio/generate`, `x-api-key` header).

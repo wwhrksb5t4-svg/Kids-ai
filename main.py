@@ -311,16 +311,30 @@ def cloudflare_error(response):
         body = None
     errors = body.get("errors") if isinstance(body, dict) else None
     codes = []
+    diagnostics = set()
     if isinstance(errors, list):
         for error in errors[:5]:
             code = error.get("code") if isinstance(error, dict) else None
             if type(code) is int and 0 <= code <= 99999999:
                 codes.append(str(code))
+            message = error.get("message", "") if isinstance(error, dict) else ""
+            if code == 5006 and isinstance(message, str):
+                message = message.lower()
+                if "unevaluated propert" in message or "additional propert" in message:
+                    diagnostics.add("unexpected field")
+                if "required propert" in message:
+                    diagnostics.add("missing required field")
+                if "maxlength" in message or "max length" in message or "too long" in message:
+                    diagnostics.add("input too long")
+                if "must be string" in message or "must be integer" in message:
+                    diagnostics.add("invalid field type")
     detail = f"; Cloudflare error code: {', '.join(codes)}" if codes else "; no Cloudflare error code returned"
+    if diagnostics:
+        detail += f"; validation: {', '.join(sorted(diagnostics))}"
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
-async def make_cloudflare_frame(scene, path, seed=None):
+async def make_cloudflare_frame(scene, path):
     description = scene.get("visual_description", "").strip()
     if not description:
         raise RuntimeError("A scene is missing its visual description for image generation.")
@@ -329,9 +343,7 @@ async def make_cloudflare_frame(scene, path, seed=None):
         "no text, no logos, no recognizable copyrighted characters. "
         + str(scene.get("character_sheet", ""))[:800] + " Scene: " + description
     )[:2048]
-    body = {"prompt": prompt, "steps": 4}
-    if seed is not None:
-        body["seed"] = seed
+    body = {"prompt": prompt}
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     try:
         async with httpx.AsyncClient(timeout=120) as http:
@@ -475,7 +487,6 @@ async def render_video(episode_id: str):
     job_dir = WORK_DIR / episode_id
     job_dir.mkdir(parents=True, exist_ok=True)
     voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
-    seed = int(episode_id.replace("-", ""), 16) % 2_000_000_000
     clips = []
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
@@ -491,7 +502,7 @@ async def render_video(episode_id: str):
         if IMAGE_PROVIDER == "cloudflare":
             frame = job_dir / f"artwork-{index}.png"
             if not frame.exists():
-                await make_cloudflare_frame(scene, frame, seed)
+                await make_cloudflare_frame(scene, frame)
         else:
             make_frame(scene, frame, index, len(scenes), episode["language"])
         try:
