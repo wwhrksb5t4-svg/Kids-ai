@@ -25,7 +25,7 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
         def respond(request):
             self.assertEqual(request.headers["Authorization"], "Bearer test-token")
             body = json.loads(request.content)
-            self.assertEqual(set(body), {"prompt", "steps"})
+            self.assertEqual(set(body), {"prompt"})
             self.assertIn("friendly turtle", body["prompt"])
             return httpx.Response(200, json={
                 "success": True,
@@ -71,6 +71,15 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
                 await main.make_cloudflare_frame({"visual_description": "turtle"}, Path(directory) / "scene.png")
         self.assertIn("HTTP 400; Cloudflare error code: 5007", str(caught.exception))
         self.assertNotIn("secret provider detail", str(caught.exception))
+
+    def test_cloudflare_validation_details_are_sanitized(self):
+        response = httpx.Response(400, json={"errors": [
+            {"code": 5006, "message": "unevaluated properties: seed; private content"},
+        ]})
+        message = main.cloudflare_error(response)
+        self.assertIn("validation: unexpected field", message)
+        self.assertNotIn("private content", message)
+        self.assertNotIn("seed", message)
 
     def test_cloudflare_requires_credentials(self):
         with patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
