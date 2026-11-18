@@ -474,6 +474,57 @@ def animated_video_filter(index, sparkle_input, captions=()):
     return ";".join(graph)
 
 
+async def prepare_scene(scene, index, total, language, voice, job_dir):
+    frame = job_dir / (f"artwork-{index}.png" if IMAGE_PROVIDER == "cloudflare" else f"scene-{index}.png")
+    audio = job_dir / f"voice-{index}.mp3"
+
+    async def prepare_image():
+        if IMAGE_PROVIDER == "cloudflare":
+            if not frame.exists():
+                await make_cloudflare_frame(scene, frame)
+        else:
+            await asyncio.to_thread(make_frame, scene, frame, index, total, language)
+
+    async def prepare_voice():
+        try:
+            await asyncio.wait_for(
+                edge_tts.Communicate(scene["narration"], voice, rate=VOICE_RATE, pitch=VOICE_PITCH).save(str(audio)),
+                timeout=120,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Voice generation timed out on scene {index+1}/{total}") from exc
+
+    tasks = [asyncio.create_task(prepare_image()), asyncio.create_task(prepare_voice())]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return frame, audio
+
+
+async def pipeline_scenes(scenes, prepare, render):
+    if not scenes:
+        raise RuntimeError("Cannot render an episode without scenes")
+    pending = asyncio.create_task(prepare(0, scenes[0]))
+    clips = []
+    try:
+        for index, scene in enumerate(scenes):
+            prepared = await pending
+            pending = None
+            if index + 1 < len(scenes):
+                pending = asyncio.create_task(prepare(index + 1, scenes[index + 1]))
+            clips.append(await render(index, scene, prepared))
+    finally:
+        if pending:
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    return clips
+
+
 async def render_video(episode_id: str):
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -487,28 +538,19 @@ async def render_video(episode_id: str):
     job_dir = WORK_DIR / episode_id
     job_dir.mkdir(parents=True, exist_ok=True)
     voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
-    clips = []
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
         music = None
     if music is None:
         music = ensure_lullaby(DATA_DIR / "lullaby.wav")
-    for index, scene in enumerate(scenes):
-        frame = job_dir / f"scene-{index}.png"
-        audio = job_dir / f"voice-{index}.mp3"
+    async def prepare(index, scene):
+        return await prepare_scene(scene, index, len(scenes), episode["language"], voice, job_dir)
+
+    async def render(index, scene, prepared):
+        frame, audio = prepared
         clip = job_dir / f"clip-{index}.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        if IMAGE_PROVIDER == "cloudflare":
-            frame = job_dir / f"artwork-{index}.png"
-            if not frame.exists():
-                await make_cloudflare_frame(scene, frame)
-        else:
-            make_frame(scene, frame, index, len(scenes), episode["language"])
-        try:
-            await asyncio.wait_for(edge_tts.Communicate(scene["narration"], voice, rate=VOICE_RATE, pitch=VOICE_PITCH).save(str(audio)), timeout=120)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(f"Voice generation timed out on scene {index+1}/{len(scenes)}") from exc
         command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music)]
@@ -537,9 +579,11 @@ async def render_video(episode_id: str):
         result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=240)
         if result.returncode:
             raise RuntimeError(f"FFmpeg failed: {result.stderr[-700:]}")
-        clips.append(clip)
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int((index+1)*90/len(scenes)), utc_now().isoformat(), episode_id))
+        return clip
+
+    clips = await pipeline_scenes(scenes, prepare, render)
     concat = job_dir / "concat.txt"
     concat.write_text("".join(f"file '{clip.as_posix()}'\n" for clip in clips), encoding="utf-8")
     output = MEDIA_DIR / f"{episode_id}.mp4"
