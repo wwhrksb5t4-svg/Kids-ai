@@ -93,5 +93,16 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
             query.answer.assert_awaited_once_with("غير مصرح", show_alert=True)
 
 
+class DashboardTest(unittest.IsolatedAsyncioTestCase):
+    async def test_status_requires_key_and_reports_counts(self):
+        with patch.object(main, "APP_API_KEY", "secret"):
+            with self.assertRaises(main.HTTPException) as caught:
+                await main.web_status("wrong")
+            self.assertEqual(caught.exception.status_code, 401)
+            result = await main.web_status("secret")
+        self.assertIn("scheduler_running", result["settings"])
+        self.assertIsInstance(result["counts"], dict)
+
+
 if __name__ == "__main__":
     unittest.main()
