@@ -2,21 +2,26 @@ import asyncio
 import base64
 import binascii
 import io
+import math
 import json
 import os
 import re
 import secrets
 import sqlite3
+import struct
 import subprocess
 import uuid
+import wave
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
+import arabic_reshaper
 import edge_tts
 import httpx
+from bidi.algorithm import get_display
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -50,7 +55,11 @@ GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
 GOOGLE_REDIRECT_URI = (os.getenv("GOOGLE_REDIRECT_URI") or (PUBLIC_BASE_URL + "/youtube/oauth/callback" if PUBLIC_BASE_URL else "")).strip()
 DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
-DAILY_TOPIC = (os.getenv("DAILY_TOPIC") or "A gentle, original sea adventure that teaches kindness, teamwork, or caring for nature").strip()
+DAILY_TOPIC = (os.getenv("DAILY_TOPIC") or "").strip()
+VOICE_AR = (os.getenv("VOICE_AR") or "ar-SA-HamedNeural").strip()
+VOICE_EN = (os.getenv("VOICE_EN") or "en-US-GuyNeural").strip()
+VOICE_RATE = (os.getenv("VOICE_RATE") or "-5%").strip()
+VOICE_PITCH = (os.getenv("VOICE_PITCH") or "+0Hz").strip()
 BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
 IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
 CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
@@ -141,10 +150,16 @@ async def select_model():
         return FASTLLM_MODEL
     response = await client.models.list()
     model_ids = sorted({item.id for item in response.data})
+    excluded = ("image", "video", "audio", "embedding", "rerank", "moderation", "seedance", "wan3", "hailuo")
+    grok_models = [
+        item for item in model_ids
+        if "grok" in item.lower() and not any(marker in item.lower() for marker in excluded)
+    ]
+    if grok_models:
+        return grok_models[0]
     for preferred in MODEL_PREFERENCES:
         if preferred in model_ids:
             return preferred
-    excluded = ("image", "video", "seedance", "wan3", "hailuo")
     for item in model_ids:
         if not any(marker in item.lower() for marker in excluded):
             return item
@@ -161,17 +176,79 @@ def parse_json(text: str):
         return json.loads(match.group(0))
 
 
-async def write_story(topic: str, language: str, model: str):
+STORY_WORLDS = (
+    "a gentle sea adventure with sea animals, teaching kindness",
+    "a cozy forest adventure with woodland animals, teaching sharing",
+    "a friendly space trip to colorful planets, teaching curiosity and teamwork",
+    "a sunny farm day with farm animals, teaching helping others",
+    "a snowy mountain adventure with arctic animals, teaching patience",
+    "a desert caravan journey with a baby camel, teaching courage and honesty",
+    "a magical garden where flowers and insects live, teaching caring for nature",
+    "a small town bakery with animal friends, teaching gratitude",
+    "a jungle river trip with playful monkeys and birds, teaching listening",
+    "a dinosaur valley with gentle baby dinosaurs, teaching friendship",
+    "a bedtime journey through a dreamy night sky, teaching calm and love",
+    "a school-day adventure with animal classmates, teaching saying sorry and forgiving",
+)
+
+
+def pick_topic(run_date: date) -> str:
+    if DAILY_TOPIC:
+        return DAILY_TOPIC
+    return STORY_WORLDS[run_date.toordinal() % len(STORY_WORLDS)]
+
+
+def recent_titles(limit=15):
+    with db() as con:
+        return [r["title"] for r in con.execute("SELECT title FROM episodes ORDER BY created_at DESC LIMIT ?", (limit,))]
+
+
+async def write_story(topic: str, language: str, model: str, avoid_titles=()):
     language_name = "Arabic" if language == "ar" else "English"
-    prompt = f"Write an original gentle sea-adventure cartoon episode for children ages 4-8 in {language_name}. Topic: {topic}. About 90 seconds of spoken narration. Use original characters and avoid copying copyrighted Sinbad adaptations or other franchises. No frightening scenes, violence, or unsafe instructions. Keep character names and events aligned between language versions. Return JSON with title, description, moral, and scenes: 5-7 objects, each having visual_description, narration, sound_effect. Write each visual_description in English, as a self-contained illustration prompt, repeating the appearance and clothing of the characters in every scene. Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
-    try:
-        response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
-        return parse_json(response.choices[0].message.content or "{}")
-    except Exception as exc:
-        if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
-            raise
-        response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Return valid JSON only. Create original safe children's stories."}, {"role": "user", "content": prompt}])
-        return parse_json(response.choices[0].message.content or "{}")
+    min_words, max_words = 300, 360
+    avoid = f" Do not reuse the plots or titles of these earlier episodes: {'; '.join(avoid_titles)}." if avoid_titles else ""
+    prompt = (
+        f"Write an original gentle cartoon episode for children ages 4-8 in {language_name}. Theme: {topic}.{avoid} "
+        f"The combined spoken narration must contain {min_words}-{max_words} words so the finished narrated video lasts about 2-3 minutes. "
+        "Use original characters and never copy copyrighted franchises. No frightening scenes, violence, or unsafe instructions. "
+        "Keep character names and events aligned between language versions. "
+        "Return JSON with: title, description, moral, art_style (one English sentence describing a single consistent visual style), "
+        "characters (1-3 objects with name and appearance; appearance is a detailed English description of face, colors and clothing), "
+        "and scenes: 5-7 objects, each having visual_description, narration, sound_effect. "
+        "Write each visual_description in English as a self-contained illustration prompt that names the characters present, the place and the action. "
+        f"Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
+    )
+    for attempt in range(3):
+        try:
+            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
+        except Exception as exc:
+            if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
+                raise
+            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Return valid JSON only. Create original safe children's stories."}, {"role": "user", "content": prompt}])
+        story = parse_json(response.choices[0].message.content or "{}")
+        scenes = story.get("scenes")
+        narration = " ".join(
+            str(scene.get("narration", ""))
+            for scene in scenes
+            if isinstance(scene, dict)
+        ) if isinstance(scenes, list) else ""
+        word_count = len(re.findall(r"\S+", narration))
+        if min_words <= word_count <= max_words:
+            return story
+        prompt += f"\nThe previous attempt had {word_count} spoken words. Regenerate it with {min_words}-{max_words} spoken words total."
+    raise RuntimeError(f"AI could not create a 2-3 minute story after 3 attempts (target: {min_words}-{max_words} spoken words).")
+
+
+def character_sheet(story) -> str:
+    style = str(story.get("art_style") or "soft colorful 3D cartoon style").strip()
+    people = []
+    for item in story.get("characters") or []:
+        if isinstance(item, dict) and item.get("name") and item.get("appearance"):
+            people.append(f"{str(item['name']).strip()}: {str(item['appearance']).strip()}")
+    sheet = f"Art style: {style}."
+    if people:
+        sheet += " Recurring characters, drawn identically in every scene: " + "; ".join(people) + "."
+    return sheet[:800]
 
 
 def font(size):
@@ -243,18 +320,22 @@ def cloudflare_error(response):
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
-async def make_cloudflare_frame(scene, path):
+async def make_cloudflare_frame(scene, path, seed=None):
     description = scene.get("visual_description", "").strip()
     if not description:
         raise RuntimeError("A scene is missing its visual description for image generation.")
     prompt = (
         "Original child-friendly storybook illustration, bright colors, gentle and safe, "
-        "no text, no logos, no recognizable copyrighted characters. " + description
+        "no text, no logos, no recognizable copyrighted characters. "
+        + str(scene.get("character_sheet", ""))[:800] + " Scene: " + description
     )[:2048]
+    body = {"prompt": prompt, "steps": 4}
+    if seed is not None:
+        body["seed"] = seed
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     try:
         async with httpx.AsyncClient(timeout=120) as http:
-            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json={"prompt": prompt, "steps": 4})
+            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json=body)
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(cloudflare_error(exc.response)) from exc
@@ -279,6 +360,74 @@ async def make_cloudflare_frame(scene, path):
         temporary.unlink(missing_ok=True)
 
 
+def audio_duration(path) -> float:
+    result = subprocess.run(["ffmpeg", "-i", str(path)], capture_output=True, text=True)
+    match = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+    if not match:
+        raise RuntimeError("Could not read voice duration")
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def shape_text(text, language):
+    if language != "ar":
+        return text
+    return get_display(arabic_reshaper.reshape(text))
+
+
+def make_caption_images(narration, language, duration, folder, index):
+    words = narration.split()
+    groups = [words[i:i + 5] for i in range(0, len(words), 5)] or [[""]]
+    total_chars = sum(len(" ".join(g)) for g in groups) or 1
+    captions, cursor = [], 0.0
+    caption_font = font(44)
+    for number, group in enumerate(groups):
+        span = duration * len(" ".join(group)) / total_chars
+        lines, line = [], ""
+        for word in group:
+            candidate = f"{line} {word}".strip()
+            if line and caption_font.getlength(shape_text(candidate, language)) > 620:
+                lines.append(line)
+                line = word
+            else:
+                line = candidate
+        lines.append(line)
+        image = Image.new("RGBA", (720, 70 * len(lines) + 40), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        draw.rounded_rectangle((20, 0, 700, image.height - 1), radius=28, fill=(0, 0, 0, 150))
+        for row, text in enumerate(lines):
+            draw.text((360, 20 + 70 * row + 35), shape_text(text, language), font=caption_font, fill=(255, 255, 255, 255), anchor="mm")
+        path = folder / f"caption-{index}-{number}.png"
+        image.save(path)
+        captions.append((path, cursor, cursor + span))
+        cursor += span
+    return captions
+
+
+def ensure_lullaby(path):
+    if path.is_file():
+        return path
+    rate = 22050
+    notes = [261.63, 293.66, 329.63, 392.0, 440.0, 392.0, 329.63, 293.66]
+    melody = [0, 2, 4, 2, 3, 1, 4, 2, 5, 3, 4, 2, 1, 0, 2, 0]
+    beat = 0.75
+    frames = bytearray()
+    for step in melody * 4:
+        frequency = notes[step % len(notes)]
+        for n in range(int(rate * beat)):
+            t = n / rate
+            envelope = math.exp(-3.0 * t / beat) * min(1.0, t * 80)
+            value = 0.6 * math.sin(2 * math.pi * frequency * t) + 0.25 * math.sin(4 * math.pi * frequency * t) + 0.15 * math.sin(2 * math.pi * frequency * 0.5 * t)
+            frames += struct.pack("<h", int(max(-1.0, min(1.0, value * envelope * 0.7)) * 32767))
+    temporary = path.with_suffix(".tmp")
+    with wave.open(str(temporary), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(bytes(frames))
+    temporary.replace(path)
+    return path
+
+
 def make_sparkle(path):
     size = 48
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -288,7 +437,7 @@ def make_sparkle(path):
     image.save(path)
 
 
-def animated_video_filter(index, sparkle_input):
+def animated_video_filter(index, sparkle_input, captions=()):
     # Alternate zoom-in / zoom-out per scene, with gentle sway, drifting bubbles and a fade-in.
     zoom = "min(1.10+0.0007*on,1.22)" if index % 2 == 0 else "max(1.22-0.0007*on,1.10)"
     graph = [
@@ -304,6 +453,11 @@ def animated_video_filter(index, sparkle_input):
             f"[{previous}][s{i}]overlay=x='{x}+25*sin(t*1.4+{i})':y='H-mod(t*{speed}+{offset},H+60)':format=auto[o{i}]"
         )
         previous = f"o{i}"
+    for number, (input_index, start, end) in enumerate(captions):
+        graph.append(
+            f"[{previous}][{input_index}:v]overlay=x=0:y='900+24*max(0,1-(t-{start:.2f})/0.2)':enable='between(t,{start:.2f},{end:.2f})':format=auto[c{number}]"
+        )
+        previous = f"c{number}"
     graph.append(f"[{previous}]fade=t=in:st=0:d=0.3[vout]")
     return ";".join(graph)
 
@@ -320,11 +474,14 @@ async def render_video(episode_id: str):
         raise RuntimeError("FFmpeg is missing")
     job_dir = WORK_DIR / episode_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    voice = "ar-SA-HamedNeural" if episode["language"] == "ar" else "en-US-GuyNeural"
+    voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
+    seed = int(episode_id.replace("-", ""), 16) % 2_000_000_000
     clips = []
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
         music = None
+    if music is None:
+        music = ensure_lullaby(DATA_DIR / "lullaby.wav")
     for index, scene in enumerate(scenes):
         frame = job_dir / f"scene-{index}.png"
         audio = job_dir / f"voice-{index}.mp3"
@@ -334,11 +491,11 @@ async def render_video(episode_id: str):
         if IMAGE_PROVIDER == "cloudflare":
             frame = job_dir / f"artwork-{index}.png"
             if not frame.exists():
-                await make_cloudflare_frame(scene, frame)
+                await make_cloudflare_frame(scene, frame, seed)
         else:
             make_frame(scene, frame, index, len(scenes), episode["language"])
         try:
-            await asyncio.wait_for(edge_tts.Communicate(scene["narration"], voice).save(str(audio)), timeout=120)
+            await asyncio.wait_for(edge_tts.Communicate(scene["narration"], voice, rate=VOICE_RATE, pitch=VOICE_PITCH).save(str(audio)), timeout=120)
         except asyncio.TimeoutError as exc:
             raise RuntimeError(f"Voice generation timed out on scene {index+1}/{len(scenes)}") from exc
         command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
@@ -349,14 +506,18 @@ async def render_video(episode_id: str):
             if not sparkle.exists():
                 make_sparkle(sparkle)
             command += ["-loop", "1", "-framerate", "24", "-i", str(sparkle)]
-            sparkle_input = 3 if music else 2
-            filters = [animated_video_filter(index, sparkle_input)]
+            sparkle_input = 3
+            captions = []
+            for number, (caption_path, start, end) in enumerate(make_caption_images(scene["narration"], episode["language"], audio_duration(audio), job_dir, index)):
+                command += ["-loop", "1", "-framerate", "24", "-i", str(caption_path)]
+                captions.append((4 + number, start, end))
+            filters = [animated_video_filter(index, sparkle_input, captions)]
             video_map = "[vout]"
         else:
             filters = ["[0:v]scale=720:1280,format=yuv420p[vout]"]
             video_map = "[vout]"
         if music:
-            filters.append("[2:a]volume=0.10[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]")
+            filters.append("[2:a]volume=0.12[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]")
             audio_map = "[aout]"
         else:
             audio_map = "1:a"
@@ -409,24 +570,24 @@ async def create_daily_episode(language: str, run_date: date):
     try:
         if episode_id is None:
             model = await select_model()
-            story = await write_story(DAILY_TOPIC, language, model)
+            topic = pick_topic(run_date)
+            story = await write_story(topic, language, model, recent_titles())
+            sheet = character_sheet(story)
             raw_scenes = story.get("scenes")
             if not isinstance(raw_scenes, list):
                 raise RuntimeError("The AI did not return scenes")
-            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves"))} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
+            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
             if not scenes:
                 raise RuntimeError("The AI returned empty narration")
             episode_id = str(uuid.uuid4())
             timestamp = utc_now().isoformat()
             with db() as con:
-                con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, DAILY_TOPIC, str(story.get("title") or DAILY_TOPIC)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model))
+                con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, topic, str(story.get("title") or topic)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model))
                 con.execute("UPDATE daily_runs SET status='rendering' WHERE run_date=? AND language=?", (run_key, language))
         await render_video(episode_id)
         with db() as con:
             con.execute("UPDATE episodes SET status='pending_review' WHERE id=?", (episode_id,))
             con.execute("UPDATE daily_runs SET status='pending_review' WHERE run_date=? AND language=?", (run_key, language))
-        if telegram_app and ADMIN_TELEGRAM_ID:
-            await send_episode_for_review(episode_id)
         return dict(con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone())
     except Exception as exc:
         with db() as con:
@@ -457,7 +618,7 @@ async def publish_episode(episode_id: str):
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
     if not row or not row["video_path"] or not Path(row["video_path"]).is_file():
         raise RuntimeError("Episode video file is missing")
-    snippet = {"title": row["title"][:100], "description": (row["description"] + "\n\n#KidsHaven #KidsStories").strip()[:5000], "tags": ["Kids Haven", "children stories", "sea adventure", "kids cartoon"], "categoryId": "1"}
+    snippet = {"title": row["title"][:100], "description": (row["description"] + "\n\n#KidsHaven #KidsStories").strip()[:5000], "tags": ["Kids Haven", "children stories", "kids cartoon", "bedtime stories"], "categoryId": "1"}
     body = {"snippet": snippet, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True}}
     media = MediaFileUpload(row["video_path"], mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
@@ -503,16 +664,28 @@ async def tg_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await create_today(update.message)
 
 
+generation_lock = asyncio.Lock()
+
+
+async def run_today(report):
+    if generation_lock.locked():
+        await report("هناك عملية إنشاء جارية الآن. انتظر انتهاءها.")
+        return False
+    async with generation_lock:
+        today = utc_now().date()
+        for language in ("ar", "en"):
+            try:
+                row = await create_daily_episode(language, today)
+                if row.get("status") in ("pending_review", "ready_for_review"):
+                    await send_episode_for_review(row["id"])
+            except Exception as exc:
+                await report(f"فشل إنشاء {'العربية' if language=='ar' else 'English'}: {str(exc)[:700]}")
+    return True
+
+
 async def create_today(message):
     await message.reply_text("بدأ إنشاء حلقتين. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
-    today = utc_now().date()
-    for language in ("ar", "en"):
-        try:
-            row = await create_daily_episode(language, today)
-            if row.get("status") in ("pending_review", "ready_for_review"):
-                await send_episode_for_review(row["id"])
-        except Exception as exc:
-            await message.reply_text(f"فشل إنشاء {'العربية' if language=='ar' else 'English'}: {str(exc)[:700]}")
+    await run_today(message.reply_text)
 
 
 async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -718,7 +891,22 @@ async def web_status(x_api_key: Optional[str] = Header(default=None)):
             "cloudflare": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
             "scheduler_running": bool(scheduler_task and not scheduler_task.done()),
         },
+        "generating": generation_lock.locked(),
     }
+
+
+async def notify_admin(text):
+    if telegram_app and ADMIN_TELEGRAM_ID:
+        await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=text)
+
+
+@app.post("/studio/generate")
+async def web_generate(x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    if generation_lock.locked():
+        return {"started": False, "reason": "already running"}
+    asyncio.create_task(run_today(notify_admin))
+    return {"started": True}
 
 
 DASHBOARD_HTML = """<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>لوحة التحكم</title>
@@ -727,17 +915,18 @@ DASHBOARD_HTML = """<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-
 .bar{background:#334155;border-radius:6px;height:10px;overflow:hidden}.bar>div{background:#38bdf8;height:100%}table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:start;border-bottom:1px solid #334155;font-size:14px}</style>
 <h1>🌊 لوحة تحكم Kids Haven</h1>
 <div class='card' id='login'><input id='key' type='password' placeholder='APP_API_KEY'> <button onclick='save()'>دخول</button> <span id='err' class='bad'></span></div>
-<div id='main' hidden><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
+<div id='main' hidden><div class='card'><button id='gen' onclick='gen()'>🎬 توليد حلقتَي اليوم الآن</button> <span id='genmsg'></span></div><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
 <div class='card'><b>الحلقات</b><div class='grid' id='counts'></div></div>
 <div class='card'><b>آخر الحلقات</b><table id='eps'></table></div>
 <div class='card'><b>التشغيل اليومي</b><table id='runs'></table></div></div>
 <script>
 const $=id=>document.getElementById(id);
+async function gen(){const r=await fetch('/studio/generate',{method:'POST',headers:{'x-api-key':sessionStorage.getItem('k')||''}});const j=await r.json();$('genmsg').textContent=j.started?'بدأ التوليد، تابع التقدم أدناه':'هناك عملية جارية';load()}
 function save(){sessionStorage.setItem('k',$('key').value);load()}
 function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(cls)e.className=cls;return e}
 async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
 function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
-async function load(){try{const [s,e]=await Promise.all([api('/studio/status'),api('/studio/episodes')]);$('login').hidden=true;$('main').hidden=false;
+async function load(){try{const [s,e]=await Promise.all([api('/studio/status'),api('/studio/episodes')]);$('login').hidden=true;$('main').hidden=false;$('gen').disabled=s.generating;
 const L={fastllm:'نموذج النص',telegram:'Telegram',admin_id:'معرّف الأدمن',youtube_connected:'YouTube',cloudflare:'Cloudflare',scheduler_running:'الجدولة'};
 $('settings').replaceChildren(...Object.entries(L).map(([k,n])=>el('div',(s.settings[k]?'✅ ':'❌ ')+n,s.settings[k]?'ok':'bad')),el('div','الصور: '+s.settings.image_provider),el('div','عربي '+s.settings.daily_ar_time+' / EN '+s.settings.daily_en_time+' UTC'));
 $('counts').replaceChildren(...Object.entries(s.counts).map(([k,v])=>el('div',k+': '+v)));

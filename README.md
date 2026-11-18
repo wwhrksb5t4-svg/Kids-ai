@@ -4,8 +4,8 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 
 ## What the bot does
 
-- Creates one Arabic and one English original sea-adventure episode per day at configured UTC times (defaults 12:00 and 14:00).
-- Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom.
+- Creates one Arabic and one English original episode per day at configured UTC times (defaults 12:00 and 14:00). Each script targets 300-360 spoken words, approximately 2-3 minutes.
+- Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
 - The button shown by `/start`, or `/today`, manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
 - `/status` includes render progress and the latest render error. `/today` retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
@@ -34,7 +34,8 @@ GOOGLE_CLIENT_SECRET=your_google_oauth_client_secret
 DATA_DIR=/app/data
 DAILY_AR_TIME=12:00
 DAILY_EN_TIME=14:00
-DAILY_TOPIC=Original gentle sea adventures teaching kindness and teamwork
+# Optional: leave unset to rotate through 12 built-in themes
+# DAILY_TOPIC=
 ```
 
 Optional: `BACKGROUND_MUSIC_PATH=/app/data/music/licensed-track.mp3` for music you have rights to use. Without this variable, the video has narration only.
@@ -85,3 +86,11 @@ Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set 
 ## Dashboard
 
 Open `/dashboard` on your Railway domain and enter `APP_API_KEY` to see settings, episode progress/errors, and daily runs (auto-refreshes every 10s). The key is kept in the browser session only.
+
+## Studio features
+
+- **Varied topics:** without `DAILY_TOPIC`, themes rotate daily (sea, forest, space, farm, ...) and the prompt avoids recent titles. **Remove `DAILY_TOPIC` from Railway** if you want rotation.
+- **Consistent characters:** the AI writes a character sheet and art style that is prepended to every image prompt, with one seed per episode.
+- **Animated subtitles** (Cloudflare mode) and an **original synthesized lullaby** under the narration (override with `BACKGROUND_MUSIC_PATH`).
+- **Voice:** `VOICE_AR`, `VOICE_EN`, `VOICE_RATE` (default `-5%`), `VOICE_PITCH` (default `+0Hz`).
+- **Dashboard** at `/dashboard` has a "generate now" button (`POST /studio/generate`, `x-api-key` header).
