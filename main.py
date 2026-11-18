@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import uuid
@@ -103,7 +104,7 @@ def admin_only(update: Update) -> bool:
 def check_admin_id(value: Optional[str]):
     if not APP_API_KEY:
         raise HTTPException(503, "Set APP_API_KEY in Railway before using web admin endpoints.")
-    if value != APP_API_KEY:
+    if not value or not secrets.compare_digest(value, APP_API_KEY):
         raise HTTPException(401, "Unauthorized")
 
 
@@ -694,3 +695,58 @@ async def web_episodes(x_api_key: Optional[str] = Header(default=None)):
     with db() as con:
         rows = con.execute("SELECT id,episode_date,language,title,status,youtube_url,render_progress,render_error,created_at FROM episodes ORDER BY created_at DESC LIMIT 100").fetchall()
     return {"episodes": [dict(row) for row in rows]}
+
+
+@app.get("/studio/status")
+async def web_status(x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    with db() as con:
+        counts = {r["status"]: r["n"] for r in con.execute("SELECT status, COUNT(*) AS n FROM episodes GROUP BY status")}
+        runs = [dict(r) for r in con.execute("SELECT run_date,language,status,error FROM daily_runs ORDER BY run_date DESC LIMIT 10")]
+    return {
+        "now_utc": utc_now().isoformat(),
+        "counts": counts,
+        "daily_runs": runs,
+        "settings": {
+            "image_provider": IMAGE_PROVIDER,
+            "daily_ar_time": DAILY_AR_TIME,
+            "daily_en_time": DAILY_EN_TIME,
+            "fastllm": bool(client),
+            "telegram": bool(TELEGRAM_BOT_TOKEN),
+            "admin_id": bool(ADMIN_TELEGRAM_ID),
+            "youtube_connected": bool(load_google_credentials()),
+            "cloudflare": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
+            "scheduler_running": bool(scheduler_task and not scheduler_task.done()),
+        },
+    }
+
+
+DASHBOARD_HTML = """<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>لوحة التحكم</title>
+<style>body{font:16px system-ui;max-width:900px;margin:20px auto;padding:0 14px;background:#0f172a;color:#e2e8f0}h1{font-size:22px}.card{background:#1e293b;border-radius:12px;padding:14px;margin:12px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}.ok{color:#4ade80}.bad{color:#f87171}input,button{font:inherit;padding:8px;border-radius:8px;border:0}
+.bar{background:#334155;border-radius:6px;height:10px;overflow:hidden}.bar>div{background:#38bdf8;height:100%}table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:start;border-bottom:1px solid #334155;font-size:14px}</style>
+<h1>🌊 لوحة تحكم Kids Haven</h1>
+<div class='card' id='login'><input id='key' type='password' placeholder='APP_API_KEY'> <button onclick='save()'>دخول</button> <span id='err' class='bad'></span></div>
+<div id='main' hidden><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
+<div class='card'><b>الحلقات</b><div class='grid' id='counts'></div></div>
+<div class='card'><b>آخر الحلقات</b><table id='eps'></table></div>
+<div class='card'><b>التشغيل اليومي</b><table id='runs'></table></div></div>
+<script>
+const $=id=>document.getElementById(id);
+function save(){sessionStorage.setItem('k',$('key').value);load()}
+function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(cls)e.className=cls;return e}
+async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
+function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
+async function load(){try{const [s,e]=await Promise.all([api('/studio/status'),api('/studio/episodes')]);$('login').hidden=true;$('main').hidden=false;
+const L={fastllm:'نموذج النص',telegram:'Telegram',admin_id:'معرّف الأدمن',youtube_connected:'YouTube',cloudflare:'Cloudflare',scheduler_running:'الجدولة'};
+$('settings').replaceChildren(...Object.entries(L).map(([k,n])=>el('div',(s.settings[k]?'✅ ':'❌ ')+n,s.settings[k]?'ok':'bad')),el('div','الصور: '+s.settings.image_provider),el('div','عربي '+s.settings.daily_ar_time+' / EN '+s.settings.daily_en_time+' UTC'));
+$('counts').replaceChildren(...Object.entries(s.counts).map(([k,v])=>el('div',k+': '+v)));
+rows($('eps'),['التاريخ','اللغة','العنوان','الحالة','التقدم'],e.episodes.slice(0,20).map(x=>{const b=document.createElement('div');b.className='bar';const i=document.createElement('div');i.style.width=(x.render_progress||0)+'%';b.append(i);const st=document.createElement('div');st.append(el('span',x.status));if(x.render_error)st.append(el('div',x.render_error.slice(0,200),'bad'));return[x.episode_date,x.language,x.title,st,b]}));
+rows($('runs'),['التاريخ','اللغة','الحالة','خطأ'],s.daily_runs.map(r=>[r.run_date,r.language,r.status,r.error]))}catch(x){$('login').hidden=false;$('main').hidden=true;$('err').textContent=sessionStorage.getItem('k')?'مفتاح خاطئ أو APP_API_KEY غير مضبوط':''}}
+if(sessionStorage.getItem('k'))load();setInterval(()=>{if(!$('main').hidden)load()},10000);
+</script></html>"""
+
+
+@app.get("/dashboard", include_in_schema=False)
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)

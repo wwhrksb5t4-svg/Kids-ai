@@ -81,3 +81,7 @@ Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set 
 - `/studio/episodes` and `/studio/stats` require `x-api-key: APP_API_KEY`
 
 `/studio/stats` reports YouTube Analytics for the last 28 complete days. The Telegram `/stats` command shows the top videos for that period.
+
+## Dashboard
+
+Open `/dashboard` on your Railway domain and enter `APP_API_KEY` to see settings, episode progress/errors, and daily runs (auto-refreshes every 10s). The key is kept in the browser session only.
