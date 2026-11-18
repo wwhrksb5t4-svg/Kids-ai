@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -91,6 +92,27 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
             await main.tg_callback(update, None)
             create.assert_not_awaited()
             query.answer.assert_awaited_once_with("غير مصرح", show_alert=True)
+
+
+class StudioHelpersTest(unittest.TestCase):
+    def test_topics_rotate_and_can_be_overridden(self):
+        with patch.object(main, "DAILY_TOPIC", ""):
+            first = main.pick_topic(date(2026, 1, 1))
+            self.assertNotEqual(first, main.pick_topic(date(2026, 1, 2)))
+        with patch.object(main, "DAILY_TOPIC", "my topic"):
+            self.assertEqual(main.pick_topic(date(2026, 1, 1)), "my topic")
+
+    def test_character_sheet_is_added_to_image_prompt(self):
+        sheet = main.character_sheet({"art_style": "watercolor", "characters": [{"name": "Lulu", "appearance": "blue fish with a red scarf"}]})
+        self.assertIn("watercolor", sheet)
+        self.assertIn("Lulu: blue fish with a red scarf", sheet)
+
+    def test_captions_cover_the_whole_narration_duration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captions = main.make_caption_images("one two three four five six seven eight", "en", 10, Path(directory), 0)
+            self.assertEqual(len(captions), 2)
+            self.assertAlmostEqual(captions[-1][2], 10)
+            self.assertTrue(all(path.exists() for path, _, _ in captions))
 
 
 class DashboardTest(unittest.IsolatedAsyncioTestCase):

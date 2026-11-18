@@ -8,3 +8,5 @@ python-telegram-bot>=21.6,<23.0
 google-api-python-client>=2.150,<3.0
 google-auth-oauthlib>=1.2,<2.0
 google-auth-httplib2>=0.2,<1.0
+arabic-reshaper>=3.0,<4.0
+python-bidi>=0.5,<1.0
