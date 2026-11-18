@@ -45,7 +45,7 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
         for response, message in (
             (httpx.Response(429), "HTTP 429"),
             (httpx.Response(200, json={"success": True, "result": {"image": "not-base64"}}), "invalid image response"),
-            (httpx.Response(200, json={"success": False}), "check credentials and quota"),
+            (httpx.Response(200, json={"success": False}), "no Cloudflare error code"),
         ):
             with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
                 transport = httpx.MockTransport(lambda request: response)
@@ -54,6 +54,19 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(RuntimeError, message):
                         await main.make_cloudflare_frame({"visual_description": "turtle"}, path)
                 self.assertFalse(path.exists())
+
+    async def test_cloudflare_error_reports_code_not_provider_text(self):
+        response = httpx.Response(400, json={"success": False, "errors": [
+            {"code": 5007, "message": "secret provider detail"},
+        ]})
+        real_client = httpx.AsyncClient
+        transport = httpx.MockTransport(lambda request: response)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(main.httpx, "AsyncClient", side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
+            with self.assertRaises(RuntimeError) as caught:
+                await main.make_cloudflare_frame({"visual_description": "turtle"}, Path(directory) / "scene.png")
+        self.assertIn("HTTP 400; Cloudflare error code: 5007", str(caught.exception))
+        self.assertNotIn("secret provider detail", str(caught.exception))
 
     def test_cloudflare_requires_credentials(self):
         with patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
