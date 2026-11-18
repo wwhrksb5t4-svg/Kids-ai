@@ -12,6 +12,9 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from PIL import Image
+from telegram import Update, User
+from telegram._bot import Bot
+from telegram.ext import Application
 
 _data_dir = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"DATA_DIR": _data_dir.name}):
@@ -218,6 +221,73 @@ class DashboardTest(unittest.IsolatedAsyncioTestCase):
             result = await main.web_status("secret")
         self.assertIn("scheduler_running", result["settings"])
         self.assertIsInstance(result["counts"], dict)
+
+
+class TelegramStatusTest(unittest.IsolatedAsyncioTestCase):
+    async def test_status_responds_while_today_or_generate_button_is_running(self):
+        for button in (False, True):
+            with self.subTest(button=button):
+                app = Application.builder().token("123:abc").build()
+                app.bot._bot_user = User(id=123, first_name="Bot", is_bot=True, username="testbot")
+                app._initialized = True
+                app._running = True
+                main.register_telegram_handlers(app)
+                user = {"id": 123, "first_name": "Admin", "is_bot": False}
+                chat = {"id": 123, "type": "private"}
+
+                def command(update_id, text):
+                    return Update.de_json({"update_id": update_id, "message": {
+                        "message_id": update_id, "date": 1700000000, "chat": chat,
+                        "from": user, "text": text,
+                        "entities": [{"type": "bot_command", "offset": 0, "length": len(text)}],
+                    }}, app.bot)
+
+                if button:
+                    first = Update.de_json({"update_id": 1, "callback_query": {
+                        "id": "test", "from": user, "chat_instance": "chat",
+                        "data": "generate:today", "message": {
+                            "message_id": 1, "date": 1700000000, "chat": chat,
+                            "from": {"id": 123, "first_name": "Bot", "is_bot": True},
+                            "text": "start",
+                        },
+                    }}, app.bot)
+                else:
+                    first = command(1, "/today")
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def wait_for_generation(report):
+                    entered.set()
+                    await release.wait()
+                    return True
+
+                with patch.object(main, "ADMIN_TELEGRAM_ID", "123"), \
+                     patch.object(main, "run_today", side_effect=wait_for_generation), \
+                     patch.object(Bot, "send_message", new_callable=AsyncMock) as send, \
+                     patch.object(Bot, "answer_callback_query", new_callable=AsyncMock):
+                    try:
+                        await app.process_update(first)
+                        await asyncio.wait_for(entered.wait(), 1)
+                        await asyncio.wait_for(app.process_update(command(2, "/status")), 1)
+                        messages = [call.kwargs["text"] for call in send.await_args_list]
+                        self.assertTrue(any("لا توجد حلقات" in text or "تشغيل اليوم" in text for text in messages))
+                    finally:
+                        release.set()
+                        await asyncio.sleep(0)
+                        app._running = False
+
+    async def test_status_shows_story_generation_before_episode_exists(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123), message=message)
+        today = main.utc_now().date().isoformat()
+        with main.db() as con:
+            con.execute("INSERT INTO daily_runs VALUES (?, ?, ?, ?)", (today, "ar", "generating", None))
+        try:
+            with patch.object(main, "ADMIN_TELEGRAM_ID", "123"):
+                await main.tg_status(update, None)
+            self.assertIn("العربية · generating", message.reply_text.await_args.args[0])
+        finally:
+            with main.db() as con:
+                con.execute("DELETE FROM daily_runs WHERE run_date=? AND language='ar'", (today,))
 
 
 if __name__ == "__main__":

@@ -624,9 +624,15 @@ async def create_daily_episode(language: str, run_date: date):
             con.execute("INSERT OR REPLACE INTO daily_runs(run_date,language,status,error) VALUES(?,?,?,NULL)", (run_key, language, "generating"))
     try:
         if episode_id is None:
-            model = await select_model()
+            try:
+                model = await asyncio.wait_for(select_model(), timeout=90)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out while selecting a text model from FastLLM.") from exc
             topic = pick_topic(run_date)
-            story = await write_story(topic, language, model, recent_titles())
+            try:
+                story = await asyncio.wait_for(write_story(topic, language, model, recent_titles()), timeout=300)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Timed out while generating the story from FastLLM.") from exc
             sheet = character_sheet(story)
             raw_scenes = story.get("scenes")
             if not isinstance(raw_scenes, list):
@@ -739,8 +745,12 @@ async def run_today(report):
 
 
 async def create_today(message):
+    if generation_lock.locked():
+        await message.reply_text("هناك عملية إنشاء جارية الآن. أرسل /status لمتابعتها.")
+        return
     await message.reply_text("بدأ إنشاء حلقتين. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
-    await run_today(message.reply_text)
+    if await run_today(message.reply_text):
+        await message.reply_text("انتهت محاولة إنشاء حلقتَي اليوم. أرسل /status لمعرفة النتيجة.")
 
 
 async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -749,6 +759,10 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with db() as con:
         rows = con.execute("SELECT episode_date,language,status,title,youtube_url,render_progress,render_error FROM episodes ORDER BY created_at DESC LIMIT 10").fetchall()
+        runs = con.execute(
+            "SELECT language,status,error FROM daily_runs WHERE run_date=? ORDER BY language",
+            (utc_now().date().isoformat(),),
+        ).fetchall()
     lines = [
         f"{'🇸🇦' if r['language']=='ar' else '🇬🇧'} {r['episode_date']} · {r['status']}"
         + (f" ({r['render_progress']}%)" if r['status'] == "rendering" else "")
@@ -757,6 +771,15 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + (f"\n{r['youtube_url']}" if r['youtube_url'] else "")
         for r in rows
     ]
+    if runs:
+        run_lines = ["تشغيل اليوم (UTC):"]
+        for run in runs:
+            label = "العربية" if run["language"] == "ar" else "English"
+            line = f"{label} · {run['status']}"
+            if run["error"]:
+                line += f"\nالخطأ: {run['error'][:250]}"
+            run_lines.append(line)
+        lines = run_lines + (["\nآخر الحلقات:"] + lines if lines else [])
     await update.message.reply_text("\n".join(lines) if lines else "لا توجد حلقات بعد.")
 
 
@@ -840,17 +863,22 @@ async def scheduler_loop():
             await asyncio.sleep(30)
 
 
+def register_telegram_handlers(application):
+    application.add_handler(CommandHandler("start", tg_start))
+    application.add_handler(CommandHandler("connect", tg_connect))
+    application.add_handler(CommandHandler("today", tg_today, block=False))
+    application.add_handler(CommandHandler("status", tg_status))
+    application.add_handler(CommandHandler("stats", tg_stats))
+    application.add_handler(CallbackQueryHandler(tg_callback, pattern=r"^generate:today$", block=False))
+    application.add_handler(CallbackQueryHandler(tg_callback))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global telegram_app, scheduler_task
     if TELEGRAM_BOT_TOKEN:
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        telegram_app.add_handler(CommandHandler("start", tg_start))
-        telegram_app.add_handler(CommandHandler("connect", tg_connect))
-        telegram_app.add_handler(CommandHandler("today", tg_today))
-        telegram_app.add_handler(CommandHandler("status", tg_status))
-        telegram_app.add_handler(CommandHandler("stats", tg_stats))
-        telegram_app.add_handler(CallbackQueryHandler(tg_callback))
+        register_telegram_handlers(telegram_app)
         await telegram_app.initialize()
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
