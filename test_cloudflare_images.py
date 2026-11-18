@@ -1,5 +1,6 @@
 import base64
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -22,7 +23,9 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
 
         def respond(request):
             self.assertEqual(request.headers["Authorization"], "Bearer test-token")
-            self.assertIn(b"friendly turtle", request.content)
+            body = json.loads(request.content)
+            self.assertEqual(set(body), {"prompt", "steps"})
+            self.assertIn("friendly turtle", body["prompt"])
             return httpx.Response(200, json={
                 "success": True,
                 "result": {"image": base64.b64encode(image_bytes.getvalue()).decode()},

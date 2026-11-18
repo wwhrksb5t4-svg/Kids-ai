@@ -253,7 +253,7 @@ async def make_cloudflare_frame(scene, path):
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     try:
         async with httpx.AsyncClient(timeout=120) as http:
-            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json={"prompt": prompt, "num_steps": 4})
+            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json={"prompt": prompt, "steps": 4})
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(cloudflare_error(exc.response)) from exc
