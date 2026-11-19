@@ -376,7 +376,32 @@ def cloudflare_error(response):
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
+async def make_pollinations_frame(prompt, path, size):
+    """Free keyless fallback used when the Cloudflare daily quota is exhausted."""
+    url = "https://image.pollinations.ai/prompt/" + quote(prompt[:900])
+    try:
+        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as http:
+            response = await http.get(url, params={"width": size[0], "height": size[1], "model": "flux", "nologo": "true", "seed": secrets.randbelow(10**6)})
+        response.raise_for_status()
+        with Image.open(io.BytesIO(response.content)) as image:
+            image = ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS)
+    except (httpx.HTTPError, UnidentifiedImageError, OSError) as exc:
+        raise RuntimeError(f"Fallback image generation failed: {exc}") from exc
+    image.save(path, format="PNG")
+
+
 async def make_cloudflare_frame(scene, path, size=(720, 1280), style=""):
+    try:
+        await _cloudflare_frame(scene, path, size, style)
+    except RuntimeError as exc:
+        if "HTTP 429" not in str(exc) and "4006" not in str(exc):
+            raise
+        print("Cloudflare quota exhausted; using Pollinations fallback.", flush=True)
+        prompt = ((style or "children's storybook illustration") + " " + str(scene.get("character_sheet", ""))[:500] + " Scene: " + str(scene.get("visual_description", "")))
+        await make_pollinations_frame(prompt, path, size)
+
+
+async def _cloudflare_frame(scene, path, size=(720, 1280), style=""):
     description = scene.get("visual_description", "").strip()
     if not description:
         raise RuntimeError("A scene is missing its visual description for image generation.")
