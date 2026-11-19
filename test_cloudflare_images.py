@@ -440,6 +440,25 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_old_animation_cache_is_replaced_and_new_cache_reused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "blender-child-v2-0.mp4").write_bytes(b"old")
+
+            def render(command, **kwargs):
+                if command[0] == "ffmpeg":
+                    Path(command[-1]).write_bytes(b"new")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch.object(main, "DATA_DIR", path), \
+                 patch.object(main, "WORK_DIR", path), \
+                 patch.object(main.subprocess, "run", side_effect=render) as run:
+                first = await main.blender_animation(0)
+                second = await main.blender_animation(0)
+            self.assertEqual(first.read_bytes(), b"new")
+            self.assertEqual(second, first)
+            self.assertEqual(run.call_count, 2)
+
     async def test_arabic_lyric_uses_basic_font_layout(self):
         used = []
 
