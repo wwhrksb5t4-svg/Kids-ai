@@ -154,6 +154,41 @@ class StudioHelpersTest(unittest.TestCase):
         self.assertIn("check Railway logs and memory usage", message)
 
 
+class StoryLengthTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def response(count, scenes=6):
+        story = {"title": "A story", "scenes": [
+            {"narration": " ".join(["word"] * count)}
+            for _ in range(scenes)
+        ]}
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(story)))])
+
+    async def test_short_story_is_revised_with_previous_response(self):
+        create = AsyncMock(side_effect=[self.response(30), self.response(55)])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(main, "client", client):
+            story = await main.write_story("friendship", "ar", "model")
+        self.assertEqual(len(story["scenes"]), 6)
+        messages = create.await_args_list[1].kwargs["messages"]
+        self.assertEqual(messages[-2]["role"], "assistant")
+        self.assertIn("180 words", messages[-1]["content"])
+        self.assertIn("Expand", messages[-1]["content"])
+
+    async def test_count_only_scenes_used_for_rendering_and_report_attempts(self):
+        create = AsyncMock(side_effect=[self.response(35, 9), self.response(55)])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(main, "client", client):
+            story = await main.write_story("friendship", "en", "model")
+        self.assertEqual(len(story["scenes"]), 6)
+        self.assertIn("280 words", create.await_args_list[1].kwargs["messages"][-1]["content"])
+
+        create = AsyncMock(side_effect=[self.response(10), self.response(20), self.response(30)])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(main, "client", client):
+            with self.assertRaisesRegex(RuntimeError, r"actual counts: 60, 120, 180"):
+                await main.write_story("friendship", "ar", "model")
+
+
 class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):
     async def test_prepares_next_scene_while_rendering_in_order(self):
         started = asyncio.Event()
