@@ -89,6 +89,7 @@ MODEL_PREFERENCES = ("gpt-5.6", "gpt-5.6-sol", "claude-sonnet-4-6", "gemini-3.8-
 client = AsyncOpenAI(api_key=FASTLLM_API_KEY, base_url=FASTLLM_BASE_URL) if FASTLLM_API_KEY else None
 telegram_app: Optional[Application] = None
 scheduler_task: Optional[asyncio.Task] = None
+production_worker_task: Optional[asyncio.Task] = None
 
 
 def utc_now():
@@ -135,6 +136,18 @@ def init_db():
         elif "source" not in columns:
             con.execute("ALTER TABLE episodes ADD COLUMN source TEXT NOT NULL DEFAULT 'daily'")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_episode_date_language ON episodes(episode_date,language) WHERE source='daily'")
+        con.execute("""CREATE TABLE IF NOT EXISTS production_jobs (
+            id TEXT PRIMARY KEY, episode_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT, cost_usd REAL, settings_json TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        job_columns = [row[1] for row in con.execute("PRAGMA table_info(production_jobs)")]
+        if "cost_usd" not in job_columns:
+            con.execute("ALTER TABLE production_jobs ADD COLUMN cost_usd REAL")
+        if "settings_json" not in job_columns:
+            con.execute("ALTER TABLE production_jobs ADD COLUMN settings_json TEXT")
+        con.execute("CREATE TABLE IF NOT EXISTS studio_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)")
         con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
             state TEXT PRIMARY KEY, created_at TEXT NOT NULL, code_verifier TEXT
         )""")
@@ -144,6 +157,69 @@ def init_db():
 
 
 init_db()
+
+def load_studio_settings():
+    global IMAGE_PROVIDER, VIDEO_PROVIDER, SONG_PROVIDER, CONTENT_MODE
+    with db() as con:
+        settings = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM studio_settings")}
+    IMAGE_PROVIDER = settings.get("image_provider", IMAGE_PROVIDER)
+    VIDEO_PROVIDER = settings.get("video_provider", VIDEO_PROVIDER)
+    SONG_PROVIDER = settings.get("song_provider", SONG_PROVIDER)
+    CONTENT_MODE = settings.get("content_mode", CONTENT_MODE)
+
+
+load_studio_settings()
+
+
+def validate_studio_settings(values):
+    if values["image_provider"] not in ("cards", "cloudflare"):
+        raise ValueError("مزود الصور يجب أن يكون cards أو cloudflare.")
+    if values["video_provider"] not in ("none", "fal", "hf", "blender"):
+        raise ValueError("مزود الفيديو يجب أن يكون none أو fal أو hf أو blender.")
+    if values["song_provider"] not in ("tts", "fal"):
+        raise ValueError("مزود الموسيقى يجب أن يكون tts أو fal.")
+    if values["content_mode"] not in ("story", "song"):
+        raise ValueError("نوع المحتوى يجب أن يكون story أو song.")
+    if values["image_provider"] == "cloudflare" and not (
+        re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
+    ):
+        raise ValueError("Cloudflare غير جاهز: أضف CLOUDFLARE_ACCOUNT_ID وCLOUDFLARE_API_TOKEN في Railway أولاً.")
+    if values["video_provider"] in ("fal", "hf") and values["image_provider"] != "cloudflare":
+        raise ValueError("تحريك fal وHugging Face يحتاج IMAGE_PROVIDER=cloudflare.")
+    if values["content_mode"] == "song" and values["image_provider"] != "cloudflare" and values["video_provider"] != "blender":
+        raise ValueError("وضع الأغاني يحتاج IMAGE_PROVIDER=cloudflare أو VIDEO_PROVIDER=blender.")
+    if (values["video_provider"] == "fal" or values["song_provider"] == "fal") and not FAL_KEY:
+        raise ValueError("مزود fal يحتاج FAL_KEY في Railway.")
+    if values["video_provider"] == "blender" and values["content_mode"] != "song":
+        raise ValueError("Blender الحالي يدعم الأغاني فقط؛ اختر song قبل تفعيله.")
+
+
+def set_studio_settings(changes):
+    global IMAGE_PROVIDER, VIDEO_PROVIDER, SONG_PROVIDER, CONTENT_MODE
+    if generation_lock.locked():
+        raise ValueError("لا تغيّر مزود الإنتاج أثناء عمل مهمة؛ جرّب بعد انتهائها أو إيقافها مؤقتاً.")
+    values = {
+        "image_provider": IMAGE_PROVIDER,
+        "video_provider": VIDEO_PROVIDER,
+        "song_provider": SONG_PROVIDER,
+        "content_mode": CONTENT_MODE,
+    }
+    if any(key not in values for key in changes):
+        raise ValueError("إعداد غير معروف.")
+    values.update(changes)
+    validate_studio_settings(values)
+    timestamp = utc_now().isoformat()
+    with db() as con:
+        con.executemany(
+            "INSERT INTO studio_settings(key,value,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            [(key, value, timestamp) for key, value in changes.items()],
+        )
+    IMAGE_PROVIDER = values["image_provider"]
+    VIDEO_PROVIDER = values["video_provider"]
+    SONG_PROVIDER = values["song_provider"]
+    CONTENT_MODE = values["content_mode"]
+    return values
 
 
 def admin_only(update: Update) -> bool:
@@ -695,9 +771,12 @@ async def prepare_scene(scene, index, total, language, voice, job_dir):
     motion = job_dir / f"motion-{index}.mp4"
 
     async def prepare_image():
-        if IMAGE_PROVIDER == "cloudflare":
-            if not frame.exists():
+        if not frame.exists():
+            if IMAGE_PROVIDER == "cloudflare":
                 await make_cloudflare_frame(scene, frame)
+            else:
+                await asyncio.to_thread(make_frame, scene, frame, index, total, language)
+        if IMAGE_PROVIDER == "cloudflare":
             if VIDEO_PROVIDER == "fal" and not motion.exists():
                 await make_fal_motion(scene, frame, motion)
             elif VIDEO_PROVIDER == "hf" and not motion.exists():
@@ -706,10 +785,10 @@ async def prepare_scene(scene, index, total, language, voice, job_dir):
                 except Exception as exc:
                     # Free Spaces are unreliable: fall back to the zoom animation for this scene.
                     print(f"HF motion failed for scene {index+1}, using zoom: {exc}", flush=True)
-        else:
-            await asyncio.to_thread(make_frame, scene, frame, index, total, language)
 
     async def prepare_voice():
+        if audio.is_file() and audio.stat().st_size:
+            return
         try:
             await asyncio.wait_for(
                 edge_tts.Communicate(scene["narration"], voice, rate=VOICE_RATE, pitch=VOICE_PITCH).save(str(audio)),
@@ -778,7 +857,7 @@ async def blender_animation(variant=0):
     return output
 
 
-async def render_song_episode(episode, scenes, meta, job_dir):
+async def render_song_episode(episode, scenes, meta, job_dir, control=None):
     if IMAGE_PROVIDER != "cloudflare" and VIDEO_PROVIDER != "blender":
         raise RuntimeError("Song videos need IMAGE_PROVIDER=cloudflare (3D scene images).")
     episode_id, language = episode["id"], episode["language"]
@@ -815,10 +894,66 @@ async def render_song_episode(episode, scenes, meta, job_dir):
             progress(8 + (position + 1) * 10 // len(selected))
         prebuilt_motion = [loops[index] for index in actions]
     output = MEDIA_DIR / f"{episode_id}.mp4"
-    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, lambda size: font(size, basic=True), shape_text, progress, prebuilt_motion=prebuilt_motion)
+    await song_studio.render_song_video(
+        scenes, timings, song_file, language, job_dir, output, image, motion,
+        lambda size: font(size, basic=True), shape_text, progress,
+        prebuilt_motion=prebuilt_motion, control=control,
+    )
+    create_video_thumbnail(output, episode.get("title", "Kids Haven"), language, MEDIA_DIR / f"{episode_id}-thumbnail.jpg")
     with db() as con:
         con.execute("UPDATE episodes SET video_path=?,status='ready_for_review',render_progress=100,updated_at=? WHERE id=?", (str(output), utc_now().isoformat(), episode_id))
     return output
+
+
+def create_video_thumbnail(video_path, title, language, destination):
+    source = destination.with_suffix(".source.png")
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "0.5", "-i", str(video_path),
+         "-frames:v", "1", "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720", str(source)],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode or not source.is_file():
+        raise RuntimeError(f"Could not create YouTube thumbnail frame: {result.stderr[-300:]}")
+    try:
+        with Image.open(source) as image:
+            cover = image.convert("RGBA")
+        overlay = Image.new("RGBA", cover.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        draw.rounded_rectangle((36, 470, 1244, 688), radius=36, fill=(0, 0, 0, 175))
+        words = str(title or "Kids Haven").split()
+        size = 68
+        while size > 36:
+            face = font(size, basic=language == "ar")
+            lines, line = [], ""
+            for word in words:
+                candidate = f"{line} {word}".strip()
+                if line and face.getlength(shape_text(candidate, language)) > 1080:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            if line:
+                lines.append(line)
+            if max((face.getlength(shape_text(item, language)) for item in lines), default=0) <= 1080:
+                break
+            size -= 4
+        draw.multiline_text(
+            (640, 579), "\n".join(shape_text(item, language) for item in lines),
+            font=face, fill=(255, 255, 255, 255), anchor="mm", align="center",
+            spacing=8, stroke_width=2, stroke_fill=(20, 20, 20, 220),
+        )
+        cover = Image.alpha_composite(cover, overlay).convert("RGB")
+        temporary = destination.with_suffix(".tmp.jpg")
+        for quality in (88, 75, 60, 45):
+            cover.save(temporary, format="JPEG", quality=quality, optimize=True)
+            if temporary.stat().st_size <= 2_000_000:
+                break
+        if temporary.stat().st_size > 2_000_000:
+            raise RuntimeError("Generated YouTube thumbnail exceeds the 2 MB upload limit.")
+        temporary.replace(destination)
+        return destination
+    finally:
+        source.unlink(missing_ok=True)
 
 
 async def render_video(episode_id: str):
@@ -833,9 +968,14 @@ async def render_video(episode_id: str):
     if not subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0:
         raise RuntimeError("FFmpeg is missing")
     job_dir = WORK_DIR / episode_id
+    if episode.get("source") == "idea":
+        job_dir /= f"{IMAGE_PROVIDER}-{VIDEO_PROVIDER}-{SONG_PROVIDER}-{CONTENT_MODE}"
     job_dir.mkdir(parents=True, exist_ok=True)
+    async def control():
+        if episode.get("source") == "idea":
+            await wait_for_production_job(episode_id)
     if episode_meta.get("kind") == "song":
-        return await render_song_episode(episode, scenes, episode_meta, job_dir)
+        return await render_song_episode(episode, scenes, episode_meta, job_dir, control=control)
     if VIDEO_PROVIDER == "blender":
         raise RuntimeError("VIDEO_PROVIDER=blender currently supports song episodes only; use CONTENT_MODE=song.")
     voice = episode_meta.get("voice") or (VOICE_AR if episode["language"] == "ar" else VOICE_EN)
@@ -845,11 +985,16 @@ async def render_video(episode_id: str):
     if music is None:
         music = ensure_lullaby(DATA_DIR / "lullaby.wav")
     async def prepare(index, scene):
+        await control()
         return await prepare_scene(scene, index, len(scenes), episode["language"], voice, job_dir)
 
     async def render(index, scene, prepared):
+        await control()
         frame, audio = prepared
         clip = job_dir / f"clip-{index}.mp4"
+        if clip.is_file() and clip.stat().st_size:
+            return clip
+        temporary_clip = job_dir / f"clip-{index}.tmp.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
         use_motion = VIDEO_PROVIDER in ("fal", "hf") and (job_dir / f"motion-{index}.mp4").exists()
@@ -883,10 +1028,12 @@ async def render_video(episode_id: str):
         else:
             audio_map = "1:a"
         command += ["-filter_complex", ";".join(filters), "-map", video_map, "-map", audio_map,
-                    "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
+                    "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(temporary_clip)]
         result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=240)
         if result.returncode:
+            temporary_clip.unlink(missing_ok=True)
             raise RuntimeError(ffmpeg_scene_error(result, index, len(scenes)))
+        temporary_clip.replace(clip)
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int((index+1)*90/len(scenes)), utc_now().isoformat(), episode_id))
         return clip
@@ -898,13 +1045,18 @@ async def render_video(episode_id: str):
     result = await asyncio.to_thread(subprocess.run, ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat), "-c", "copy", "-movflags", "+faststart", str(output)], capture_output=True, text=True, timeout=300)
     if result.returncode:
         raise RuntimeError(f"Video assembly failed: {result.stderr[-700:]}")
+    create_video_thumbnail(output, episode["title"], episode["language"], MEDIA_DIR / f"{episode_id}-thumbnail.jpg")
     with db() as con:
         con.execute("UPDATE episodes SET video_path=?,status='ready_for_review',render_progress=100,updated_at=? WHERE id=?", (str(output), utc_now().isoformat(), episode_id))
     return output
 
 
 def telegram_keyboard(episode_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("✅ Approve & publish to YouTube", callback_data=f"publish:{episode_id}"), InlineKeyboardButton("🗑 Reject", callback_data=f"reject:{episode_id}")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ نشر الآن", callback_data=f"publish:{episode_id}"),
+         InlineKeyboardButton("🗓 جدولة النشر", callback_data=f"schedule:{episode_id}")],
+        [InlineKeyboardButton("🗑 رفض", callback_data=f"reject:{episode_id}")],
+    ])
 
 
 async def create_daily_episode(language: str, run_date: date):
@@ -1066,12 +1218,136 @@ async def tg_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح.")
         return
     if len(context.args) != 1:
-        await update.message.reply_text("استخدم /resume متبوعاً بمعرّف المسودة الفاشلة.")
+        await update.message.reply_text("استخدم /resume متبوعاً بمعرّف مهمة متوقفة أو فاشلة.")
         return
     await produce_idea_episode(context.args[0], update.message.reply_text)
 
 
-async def publish_episode(episode_id: str):
+async def tg_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 3:
+        await update.message.reply_text("استخدم: /schedule EPISODE_ID YYYY-MM-DD HH:MM — الوقت بتوقيت UTC.")
+        return
+    episode_id = context.args[0]
+    with db() as con:
+        row = con.execute("SELECT status FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if not row or row["status"] not in ("pending_review", "ready_for_review"):
+        await update.message.reply_text("الحلقة ليست بانتظار المراجعة.")
+        return
+    try:
+        publish_at = datetime.strptime(
+            f"{context.args[1]} {context.args[2]}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=timezone.utc)
+        link = await publish_episode(episode_id, publish_at=publish_at)
+        await update.message.reply_text(f"تمت جدولة الفيديو على YouTube:\n{link}")
+    except (ValueError, RuntimeError) as exc:
+        await update.message.reply_text(f"تعذر جدولة النشر: {str(exc)[:700]}")
+    except Exception as exc:
+        await update.message.reply_text(f"فشلت جدولة النشر: {str(exc)[:700]}")
+
+
+async def tg_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("استخدم /pause متبوعاً بمعرّف المهمة.")
+        return
+    episode_id = context.args[0]
+    with db() as con:
+        changed = con.execute(
+            "UPDATE production_jobs SET status='paused',updated_at=? WHERE episode_id=? AND status IN ('queued','running')",
+            (utc_now().isoformat(), episode_id),
+        ).rowcount
+        if changed:
+            con.execute("UPDATE episodes SET status='paused',updated_at=? WHERE id=?", (utc_now().isoformat(), episode_id))
+    await update.message.reply_text(
+        "تم إيقاف المهمة مؤقتاً؛ إذا كان طلب خارجي جارياً فسيكتمل قبل التوقف."
+        if changed else "المهمة غير موجودة أو ليست قيد التشغيل."
+    )
+
+
+async def tg_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("استخدم /stop متبوعاً بمعرّف المهمة.")
+        return
+    episode_id = context.args[0]
+    with db() as con:
+        changed = con.execute(
+            "UPDATE production_jobs SET status='cancelled',updated_at=? WHERE episode_id=? AND status IN ('queued','running','paused')",
+            (utc_now().isoformat(), episode_id),
+        ).rowcount
+        if changed:
+            con.execute("UPDATE episodes SET status='cancelled',updated_at=? WHERE id=?", (utc_now().isoformat(), episode_id))
+    await update.message.reply_text(
+        "تم إلغاء المهمة. قد يكتمل طلب المزود الحالي قبل إيقاف بقية الخطوات."
+        if changed else "المهمة غير موجودة أو سبق اكتمالها."
+    )
+
+
+async def tg_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    with db() as con:
+        rows = con.execute(
+            "SELECT j.episode_id,j.status,j.attempts,j.error,j.cost_usd,e.title,e.render_progress "
+            "FROM production_jobs j JOIN episodes e ON e.id=j.episode_id "
+            "ORDER BY j.created_at DESC LIMIT 15"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("طابور الإنتاج فارغ.")
+        return
+    labels = {
+        "queued": "بالانتظار", "running": "قيد الإنتاج", "paused": "متوقفة",
+        "completed": "جاهزة للمراجعة", "failed": "فشلت", "cancelled": "ملغاة",
+    }
+    lines = []
+    for row in rows:
+        line = f"{labels.get(row['status'], row['status'])} · {row['title']} ({row['render_progress']}%)\n{row['episode_id']}"
+        if row["status"] == "running":
+            line += f"\n/pause {row['episode_id']} · /stop {row['episode_id']}"
+        elif row["status"] in ("paused", "failed"):
+            line += f"\n/resume {row['episode_id']} · /stop {row['episode_id']}"
+        if row["error"]:
+            line += f"\nالخطأ: {row['error'][:180]}"
+        if row["cost_usd"] is not None:
+            line += f"\nالتكلفة المسجلة: ${row['cost_usd']:.2f}"
+        else:
+            line += f"\nلتسجيل تكلفة الفاتورة: /cost {row['episode_id']} USD"
+        lines.append(line)
+    await update.message.reply_text("\n\n".join(lines)[:3900])
+
+
+async def tg_cost(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("استخدم /cost EPISODE_ID USD_AMOUNT لتسجيل التكلفة الفعلية من فاتورة مزود الخدمة.")
+        return
+    try:
+        amount = float(context.args[1])
+    except ValueError:
+        await update.message.reply_text("أدخل مبلغاً رقمياً بالدولار.")
+        return
+    if not math.isfinite(amount) or not 0 <= amount <= 10000:
+        await update.message.reply_text("التكلفة يجب أن تكون بين 0 و10000 دولار.")
+        return
+    with db() as con:
+        changed = con.execute(
+            "UPDATE production_jobs SET cost_usd=?,updated_at=? WHERE episode_id=?",
+            (amount, utc_now().isoformat(), context.args[0]),
+        ).rowcount
+    await update.message.reply_text("تم حفظ التكلفة اليدوية بالدولار." if changed else "المهمة غير موجودة.")
+
+
+async def publish_episode(episode_id: str, publish_at: Optional[datetime] = None):
     youtube, _ = youtube_services()
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -1081,16 +1357,42 @@ async def publish_episode(episode_id: str):
     tags = ["Kids Haven", "nursery rhymes", "kids songs", "children songs", "cartoon for kids"] + list(meta.get("tags") or [])
     lyrics = ("\n\nLyrics:\n" + meta["lyrics"]) if meta.get("lyrics") else ""
     snippet = {"title": row["title"][:100], "description": (row["description"] + lyrics + "\n\n#KidsHaven #NurseryRhymes #KidsSongs").strip()[:4900], "tags": tags[:25], "categoryId": "1"}
-    body = {"snippet": snippet, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True}}
+    youtube_status = {
+        "privacyStatus": "private" if publish_at else "public",
+        "selfDeclaredMadeForKids": True,
+    }
+    if publish_at:
+        if publish_at.tzinfo is None or publish_at <= utc_now() + timedelta(minutes=10):
+            raise RuntimeError("Scheduled publish time must be at least 10 minutes in the future and include a timezone.")
+        youtube_status["publishAt"] = publish_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    body = {"snippet": snippet, "status": youtube_status}
+    thumbnail = MEDIA_DIR / f"{episode_id}-thumbnail.jpg"
+    thumbnail_warning = ""
+    if not thumbnail.is_file():
+        try:
+            await asyncio.to_thread(create_video_thumbnail, row["video_path"], row["title"], row["language"], thumbnail)
+        except Exception as exc:
+            thumbnail_warning = f"\nتعذر إنشاء الصورة المصغرة: {str(exc)[:200]}"
     media = MediaFileUpload(row["video_path"], mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     result = await asyncio.to_thread(request.execute)
     video_id = result["id"]
     link = f"https://www.youtube.com/watch?v={video_id}"
+    status = "scheduled" if publish_at else "published"
     with db() as con:
-        con.execute("UPDATE episodes SET status='published',youtube_video_id=?,youtube_url=?,updated_at=? WHERE id=?", (video_id, link, utc_now().isoformat(), episode_id))
-        con.execute("UPDATE daily_runs SET status='published' WHERE run_date=? AND language=?", (row["episode_date"], row["language"]))
-    return link
+        con.execute("UPDATE episodes SET status=?,youtube_video_id=?,youtube_url=?,updated_at=? WHERE id=?", (status, video_id, link, utc_now().isoformat(), episode_id))
+        con.execute("UPDATE daily_runs SET status=? WHERE run_date=? AND language=?", (status, row["episode_date"], row["language"]))
+    if thumbnail.is_file():
+        try:
+            await asyncio.to_thread(
+                youtube.thumbnails().set(
+                    videoId=video_id,
+                    media_body=MediaFileUpload(str(thumbnail), mimetype="image/jpeg"),
+                ).execute
+            )
+        except Exception as exc:
+            thumbnail_warning += f"\nالفيديو {'مجدول' if publish_at else 'نُشر'}، لكن تعذر رفع الصورة المصغرة: {str(exc)[:250]}"
+    return link + thumbnail_warning
 
 
 async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1103,6 +1405,29 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✨ إنشاء فيديو من فكرة", callback_data="idea:new")],
             [InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")],
         ]),
+    )
+
+
+def settings_keyboard():
+    options = [
+        ("نوع المحتوى", "content_mode", [("قصص", "story"), ("أغاني", "song")]),
+        ("الصور", "image_provider", [("بطاقات", "cards"), ("Cloudflare AI", "cloudflare")]),
+        ("الفيديو", "video_provider", [("بدون تحريك", "none"), ("fal.ai", "fal"), ("Hugging Face", "hf"), ("Blender", "blender")]),
+        ("الموسيقى", "song_provider", [("TTS وإيقاع", "tts"), ("غناء fal.ai", "fal")]),
+    ]
+    rows = []
+    for label, key, values in options:
+        rows.append([InlineKeyboardButton(f"{label}: {name}", callback_data=f"settings:{key}:{value}") for name, value in values])
+    return InlineKeyboardMarkup(rows)
+
+
+async def tg_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    await update.message.reply_text(
+        f"الإعدادات الفعّالة حالياً:\nالمحتوى: {CONTENT_MODE}\nالصور: {IMAGE_PROVIDER}\nالفيديو: {VIDEO_PROVIDER}\nالموسيقى: {SONG_PROVIDER}\n\nالخدمات التي تحتاج مفاتيح لن تعمل قبل ضبطها في Railway.",
+        reply_markup=settings_keyboard(),
     )
 
 
@@ -1300,12 +1625,33 @@ async def tg_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 generation_lock = asyncio.Lock()
 
 
-async def produce_idea_episode(episode_id, report):
-    if generation_lock.locked():
-        await report("فيه إنتاج آخر شغال الآن. جرّب الموافقة بعد انتهائه.")
+class ProductionCancelled(Exception):
+    pass
+
+
+async def wait_for_production_job(episode_id):
+    while True:
+        with db() as con:
+            row = con.execute("SELECT status FROM production_jobs WHERE episode_id=?", (episode_id,)).fetchone()
+        if not row:
+            return
+        if row["status"] == "paused":
+            await asyncio.sleep(1)
+            continue
+        if row["status"] == "cancelled":
+            raise ProductionCancelled("Production stopped by the admin.")
+        if row["status"] != "running":
+            raise RuntimeError(f"Production job left the running state ({row['status']}).")
         return
+
+
+async def produce_idea_episode(episode_id, report):
     with db() as con:
-        row = con.execute("SELECT status,source,updated_at FROM episodes WHERE id=?", (episode_id,)).fetchone()
+        row = con.execute(
+            "SELECT episodes.status,episodes.source,episodes.updated_at,production_jobs.status AS job_status "
+            "FROM episodes LEFT JOIN production_jobs ON production_jobs.episode_id=episodes.id WHERE episodes.id=?",
+            (episode_id,),
+        ).fetchone()
     if not row or row["source"] != "idea":
         await report("هذه المسودة غير موجودة أو سبق بدء إنتاجها.")
         return
@@ -1313,35 +1659,110 @@ async def produce_idea_episode(episode_id, report):
         row["status"] == "rendering"
         and row["updated_at"] < (utc_now() - RENDER_RETRY_AFTER).isoformat()
     )
-    if row["status"] not in ("draft", "failed") and not retrying_stale:
+    paused_retry = row["status"] == "paused" and row["job_status"] == "paused"
+    if row["status"] not in ("draft", "failed") and not retrying_stale and not paused_retry:
         await report("هذه المسودة غير موجودة أو سبق بدء إنتاجها.")
         return
     if VIDEO_PROVIDER == "blender":
         await report("وضع Blender الحالي يدعم حلقات الأغاني الجاهزة فقط، وليس تمثيل القصص. غيّر VIDEO_PROVIDER إلى none أو fal أو hf قبل بدء إنتاج هذه المسودة.")
         return
+    timestamp = utc_now().isoformat()
+    settings_json = json.dumps({
+        "image_provider": IMAGE_PROVIDER,
+        "video_provider": VIDEO_PROVIDER,
+        "song_provider": SONG_PROVIDER,
+        "content_mode": "story",
+    })
+    with db() as con:
+        con.execute(
+            "INSERT INTO production_jobs(id,episode_id,status,attempts,settings_json,created_at,updated_at) VALUES(?,?, 'queued',0,?,?,?) "
+            "ON CONFLICT(episode_id) DO UPDATE SET status='queued',error=NULL,settings_json=excluded.settings_json,updated_at=excluded.updated_at "
+            "WHERE production_jobs.status IN ('failed','paused')",
+            (episode_id, episode_id, settings_json, timestamp, timestamp),
+        )
+        queued = con.execute("SELECT status FROM production_jobs WHERE episode_id=?", (episode_id,)).fetchone()
+        if queued and queued["status"] == "queued":
+            con.execute(
+                "UPDATE episodes SET status='queued',render_error=NULL,updated_at=? WHERE id=? AND source='idea' AND status IN ('draft','failed','rendering','paused','queued')",
+                (timestamp, episode_id),
+            )
+    if not queued or queued["status"] != "queued":
+        await report("هذه المهمة قيد التنفيذ أو لا يمكن إعادة تشغيلها.")
+        return
+    await report("تم حفظ طلب الإنتاج في الطابور. يمكنك متابعة الحالة عبر /queue.")
+
+
+async def process_production_job(episode_id):
+    global IMAGE_PROVIDER, VIDEO_PROVIDER, SONG_PROVIDER, CONTENT_MODE
     async with generation_lock:
         with db() as con:
+            job = con.execute(
+                "SELECT settings_json FROM production_jobs WHERE episode_id=? AND status='queued'",
+                (episode_id,),
+            ).fetchone()
+            if not job:
+                return
             changed = con.execute(
-                "UPDATE episodes SET status='rendering',render_progress=0,render_error=NULL,updated_at=? WHERE id=? AND source='idea' AND (status IN ('draft','failed') OR (status='rendering' AND updated_at<?))",
-                (utc_now().isoformat(), episode_id, (utc_now() - RENDER_RETRY_AFTER).isoformat()),
+                "UPDATE production_jobs SET status='running',attempts=attempts+1,error=NULL,updated_at=? WHERE episode_id=? AND status='queued'",
+                (utc_now().isoformat(), episode_id),
             ).rowcount
+            if changed:
+                con.execute("UPDATE episodes SET status='rendering',render_error=NULL,updated_at=? WHERE id=?", (utc_now().isoformat(), episode_id))
         if not changed:
-            await report("هذه المسودة قيد الإنتاج أو تم التعامل معها مسبقاً.")
             return
-        await report("تمت الموافقة على السيناريو. بدأ إنتاج المشاهد والصوت والمونتاج.")
+        previous_settings = (IMAGE_PROVIDER, VIDEO_PROVIDER, SONG_PROVIDER, CONTENT_MODE)
         try:
+            if job["settings_json"]:
+                settings = json.loads(job["settings_json"])
+                validate_studio_settings(settings)
+                IMAGE_PROVIDER = settings["image_provider"]
+                VIDEO_PROVIDER = settings["video_provider"]
+                SONG_PROVIDER = settings["song_provider"]
+                CONTENT_MODE = settings["content_mode"]
+            await wait_for_production_job(episode_id)
             await render_video(episode_id)
+            with db() as con:
+                con.execute("UPDATE production_jobs SET status='completed',updated_at=? WHERE episode_id=?", (utc_now().isoformat(), episode_id))
             if await send_episode_for_review(episode_id):
-                await report("اكتمل الفيديو وأرسلته للمراجعة. لن يُنشر على YouTube إلا بعد موافقتك على الفيديو النهائي.")
+                await notify_admin("اكتمل الفيديو وأرسلته للمراجعة. لن يُنشر على YouTube إلا بعد موافقتك على الفيديو النهائي.")
             else:
-                await report(f"اكتمل الفيديو لكن تعذر إرساله تلقائياً. أعد الإرسال للمراجعة بالأمر /review {episode_id}")
+                await notify_admin(f"اكتمل الفيديو لكن تعذر إرساله تلقائياً. أعد الإرسال للمراجعة بالأمر /review {episode_id}")
+        except ProductionCancelled:
+            with db() as con:
+                con.execute("UPDATE production_jobs SET status='cancelled',updated_at=? WHERE episode_id=?", (utc_now().isoformat(), episode_id))
+                con.execute("UPDATE episodes SET status='cancelled',updated_at=? WHERE id=?", (utc_now().isoformat(), episode_id))
         except Exception as exc:
             with db() as con:
+                con.execute("UPDATE production_jobs SET status='failed',error=?,updated_at=? WHERE episode_id=?", (str(exc)[:1000], utc_now().isoformat(), episode_id))
                 con.execute(
                     "UPDATE episodes SET status='failed',render_error=?,updated_at=? WHERE id=?",
                     (str(exc)[:1000], utc_now().isoformat(), episode_id),
                 )
-            await report(f"فشل إنتاج الفيديو: {str(exc)[:700]}\nيمكن إعادة المحاولة من /status ثم /resume {episode_id}")
+            await notify_admin(f"فشل إنتاج الفيديو: {str(exc)[:700]}\nيمكن إيقافه أو إعادة المحاولة بالأمر /resume {episode_id}")
+        finally:
+            IMAGE_PROVIDER, VIDEO_PROVIDER, SONG_PROVIDER, CONTENT_MODE = previous_settings
+
+
+async def production_worker_loop():
+    with db() as con:
+        con.execute("UPDATE production_jobs SET status='queued',updated_at=? WHERE status='running'", (utc_now().isoformat(),))
+        con.execute(
+            "UPDATE episodes SET status='queued',updated_at=? WHERE id IN (SELECT episode_id FROM production_jobs WHERE status='queued') AND status='rendering'",
+            (utc_now().isoformat(),),
+        )
+    while True:
+        try:
+            with db() as con:
+                row = con.execute("SELECT episode_id FROM production_jobs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+            if row:
+                await process_production_job(row["episode_id"])
+            else:
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await notify_admin(f"توقف عامل طابور الإنتاج مؤقتاً: {str(exc)[:400]}")
+            await asyncio.sleep(5)
 
 
 async def run_today(report):
@@ -1440,6 +1861,21 @@ async def tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "وتراجع السيناريو قبل بدء الإنتاج.\n/cancel لإلغاء."
         )
         return
+    if query.data.startswith("settings:"):
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            await query.message.reply_text("خيار الإعدادات غير صالح.")
+            return
+        try:
+            values = set_studio_settings({parts[1]: parts[2]})
+            await query.message.reply_text(
+                f"تم حفظ الإعدادات: المحتوى {values['content_mode']} · الصور {values['image_provider']} · "
+                f"الفيديو {values['video_provider']} · الموسيقى {values['song_provider']}",
+                reply_markup=settings_keyboard(),
+            )
+        except ValueError as exc:
+            await query.message.reply_text(str(exc), reply_markup=settings_keyboard())
+        return
     if query.data.startswith("idea:type:") or query.data.startswith("idea:duration:") or query.data.startswith("idea:language:") or query.data.startswith("idea:voice:"):
         await tg_idea_selection(query, context, query.data.split(":"))
         return
@@ -1454,6 +1890,12 @@ async def tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (utc_now().isoformat(), episode_id),
             ).rowcount
         await query.message.reply_text("تم حذف المسودة." if changed else "المسودة غير موجودة أو لم تعد قابلة للحذف.")
+        return
+    if query.data.startswith("schedule:"):
+        episode_id = query.data.split(":", 1)[1]
+        await query.message.reply_text(
+            f"للموافقة على الجدولة، أرسل الأمر:\n/schedule {episode_id} YYYY-MM-DD HH:MM\nالوقت بتوقيت UTC، ويجب أن يكون بعد 10 دقائق على الأقل."
+        )
         return
     action, episode_id = query.data.split(":", 1)
     if action == "reject":
@@ -1506,12 +1948,17 @@ async def scheduler_loop():
 
 def register_telegram_handlers(application):
     application.add_handler(CommandHandler("start", tg_start))
+    application.add_handler(CommandHandler("settings", tg_settings))
     application.add_handler(CommandHandler("new", tg_new))
     application.add_handler(CommandHandler("cancel", tg_cancel))
+    application.add_handler(CommandHandler("queue", tg_queue))
+    application.add_handler(CommandHandler("pause", tg_pause))
+    application.add_handler(CommandHandler("stop", tg_stop))
     application.add_handler(CommandHandler("connect", tg_connect))
     application.add_handler(CommandHandler("today", tg_today, block=False))
     application.add_handler(CommandHandler("review", tg_review, block=False))
     application.add_handler(CommandHandler("resume", tg_resume, block=False))
+    application.add_handler(CommandHandler("schedule", tg_schedule, block=False))
     application.add_handler(CommandHandler("status", tg_status))
     application.add_handler(CommandHandler("stats", tg_stats))
     application.add_handler(CallbackQueryHandler(tg_callback, pattern=r"^generate:today$", block=False))
@@ -1521,7 +1968,7 @@ def register_telegram_handlers(application):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app, scheduler_task
+    global telegram_app, scheduler_task, production_worker_task
     if TELEGRAM_BOT_TOKEN:
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         register_telegram_handlers(telegram_app)
@@ -1529,11 +1976,14 @@ async def lifespan(app: FastAPI):
         await telegram_app.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         scheduler_task = asyncio.create_task(scheduler_loop())
+        production_worker_task = asyncio.create_task(production_worker_loop())
     yield
-    if scheduler_task:
-        scheduler_task.cancel()
+    for task in (scheduler_task, production_worker_task):
+        if not task:
+            continue
+        task.cancel()
         try:
-            await scheduler_task
+            await task
         except asyncio.CancelledError:
             pass
     if telegram_app:
@@ -1599,6 +2049,71 @@ async def web_episodes(x_api_key: Optional[str] = Header(default=None)):
     return {"episodes": [dict(row) for row in rows]}
 
 
+@app.get("/studio/queue")
+async def web_queue(x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    with db() as con:
+        rows = con.execute(
+            "SELECT j.episode_id,j.status,j.attempts,j.error,j.cost_usd,j.created_at,j.updated_at,e.title,e.render_progress "
+            "FROM production_jobs j JOIN episodes e ON e.id=j.episode_id ORDER BY j.created_at DESC LIMIT 100"
+        ).fetchall()
+    return {"jobs": [dict(row) for row in rows]}
+
+
+@app.post("/studio/settings")
+async def web_settings(payload: dict, x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    try:
+        return {"settings": set_studio_settings(payload)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/studio/queue/{episode_id}/{action}")
+async def web_job_control(episode_id: str, action: str, x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    if action == "resume":
+        messages = []
+        async def report(text):
+            messages.append(text)
+        await produce_idea_episode(episode_id, report)
+        return {"message": messages[-1] if messages else "لم يتم تغيير المهمة."}
+    if action not in ("pause", "stop"):
+        raise HTTPException(400, "Action must be pause, stop, or resume.")
+    target = "paused" if action == "pause" else "cancelled"
+    allowed = ("queued", "running") if action == "pause" else ("queued", "running", "paused")
+    placeholders = ",".join("?" for _ in allowed)
+    with db() as con:
+        changed = con.execute(
+            f"UPDATE production_jobs SET status=?,updated_at=? WHERE episode_id=? AND status IN ({placeholders})",
+            (target, utc_now().isoformat(), episode_id, *allowed),
+        ).rowcount
+        if changed:
+            con.execute("UPDATE episodes SET status=?,updated_at=? WHERE id=?", (target, utc_now().isoformat(), episode_id))
+    if not changed:
+        raise HTTPException(409, "Job does not exist or cannot be controlled in its current state.")
+    return {"status": target}
+
+
+@app.post("/studio/queue/{episode_id}/cost")
+async def web_job_cost(episode_id: str, payload: dict, x_api_key: Optional[str] = Header(default=None)):
+    check_admin_id(x_api_key)
+    try:
+        amount = float(payload.get("cost_usd"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "cost_usd must be a number in USD.")
+    if not math.isfinite(amount) or not 0 <= amount <= 10000:
+        raise HTTPException(400, "cost_usd must be between 0 and 10000.")
+    with db() as con:
+        changed = con.execute(
+            "UPDATE production_jobs SET cost_usd=?,updated_at=? WHERE episode_id=?",
+            (amount, utc_now().isoformat(), episode_id),
+        ).rowcount
+    if not changed:
+        raise HTTPException(404, "Production job not found.")
+    return {"episode_id": episode_id, "cost_usd": amount}
+
+
 @app.get("/studio/status")
 async def web_status(x_api_key: Optional[str] = Header(default=None)):
     check_admin_id(x_api_key)
@@ -1612,6 +2127,8 @@ async def web_status(x_api_key: Optional[str] = Header(default=None)):
         "settings": {
             "image_provider": IMAGE_PROVIDER,
             "video_provider": VIDEO_PROVIDER,
+            "song_provider": SONG_PROVIDER,
+            "content_mode": CONTENT_MODE,
             "daily_languages": list(DAILY_LANGUAGES),
             "daily_ar_time": DAILY_AR_TIME,
             "daily_en_time": DAILY_EN_TIME,
@@ -1621,6 +2138,7 @@ async def web_status(x_api_key: Optional[str] = Header(default=None)):
             "youtube_connected": bool(load_google_credentials()),
             "cloudflare": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
             "scheduler_running": bool(scheduler_task and not scheduler_task.done()),
+            "production_worker_running": bool(production_worker_task and not production_worker_task.done()),
         },
         "generating": generation_lock.locked(),
     }
@@ -1646,8 +2164,9 @@ DASHBOARD_HTML = """<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-
 .bar{background:#334155;border-radius:6px;height:10px;overflow:hidden}.bar>div{background:#38bdf8;height:100%}table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:start;border-bottom:1px solid #334155;font-size:14px}</style>
 <h1>🌊 لوحة تحكم Kids Haven</h1>
 <div class='card' id='login'><input id='key' type='password' placeholder='APP_API_KEY'> <button onclick='save()'>دخول</button> <span id='err' class='bad'></span></div>
-<div id='main' hidden><div class='card'><button id='gen' onclick='gen()'>🎬 توليد حلقات اليوم الآن</button> <span id='genmsg'></span></div><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
+<div id='main' hidden><div class='card'><button id='gen' onclick='gen()'>🎬 توليد حلقات اليوم الآن</button> <span id='genmsg'></span></div><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div><div class='grid' id='providerControls'></div><button onclick='saveProviders()'>حفظ مزودي الإنتاج</button> <span id='providerMsg'></span></div>
 <div class='card'><b>الحلقات</b><div class='grid' id='counts'></div></div>
+<div class='card'><b>طابور الإنتاج</b><table id='queue'></table></div>
 <div class='card'><b>آخر الحلقات</b><table id='eps'></table></div>
 <div class='card'><b>التشغيل اليومي</b><table id='runs'></table></div></div>
 <script>
@@ -1656,11 +2175,18 @@ async function gen(){const r=await fetch('/studio/generate',{method:'POST',heade
 function save(){sessionStorage.setItem('k',$('key').value);load()}
 function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(cls)e.className=cls;return e}
 async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
+async function post(p,body){const r=await fetch(p,{method:'POST',headers:{'x-api-key':sessionStorage.getItem('k')||'','Content-Type':'application/json'},body:JSON.stringify(body||{})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);return j}
 function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
-async function load(){try{const [s,e]=await Promise.all([api('/studio/status'),api('/studio/episodes')]);$('login').hidden=true;$('main').hidden=false;$('gen').disabled=s.generating;
+const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['fal','fal.ai'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
+function drawProviders(settings){const c=$('providerControls');c.replaceChildren();for(const [key,label] of [['content_mode','نوع المحتوى'],['image_provider','الصور'],['video_provider','الفيديو'],['song_provider','الموسيقى']]){const wrap=document.createElement('label');wrap.append(el('div',label));const s=document.createElement('select');s.dataset.setting=key;for(const [value,name] of providerOptions[key]){const o=document.createElement('option');o.value=value;o.textContent=name;s.append(o)}s.value=settings[key];wrap.append(s);c.append(wrap)}}
+async function saveProviders(){const payload={};document.querySelectorAll('[data-setting]').forEach(x=>payload[x.dataset.setting]=x.value);try{const r=await post('/studio/settings',payload);$('providerMsg').textContent='تم الحفظ';drawProviders(r.settings);load()}catch(e){$('providerMsg').textContent=e.message}}
+async function jobAction(id,action){try{await post('/studio/queue/'+encodeURIComponent(id)+'/'+action,{});load()}catch(e){$('genmsg').textContent=e.message}}
+async function saveCost(id,input){try{await post('/studio/queue/'+encodeURIComponent(id)+'/cost',{cost_usd:input.value});load()}catch(e){$('genmsg').textContent=e.message}}
+async function load(){try{const [s,e,q]=await Promise.all([api('/studio/status'),api('/studio/episodes'),api('/studio/queue')]);$('login').hidden=true;$('main').hidden=false;$('gen').disabled=s.generating;if(!document.querySelector('[data-setting]:focus'))drawProviders(s.settings);
 const L={fastllm:'نموذج النص',telegram:'Telegram',admin_id:'معرّف الأدمن',youtube_connected:'YouTube',cloudflare:'Cloudflare',scheduler_running:'الجدولة'};
 $('settings').replaceChildren(...Object.entries(L).map(([k,n])=>el('div',(s.settings[k]?'✅ ':'❌ ')+n,s.settings[k]?'ok':'bad')),el('div','الصور: '+s.settings.image_provider),el('div','عربي '+s.settings.daily_ar_time+' / EN '+s.settings.daily_en_time+' UTC'));
 $('counts').replaceChildren(...Object.entries(s.counts).map(([k,v])=>el('div',k+': '+v)));
+rows($('queue'),['المهمة','الحالة','التقدم','التكلفة USD','تحكم'],q.jobs.map(j=>{const controls=document.createElement('span');for(const [a,n] of (j.status==='running'?[['pause','إيقاف مؤقت'],['stop','إلغاء']]:j.status==='paused'?[['resume','استكمال'],['stop','إلغاء']]:j.status==='failed'?[['resume','إعادة محاولة']]:j.status==='queued'?[['stop','إلغاء']]:[])){const b=document.createElement('button');b.textContent=n;b.onclick=()=>jobAction(j.episode_id,a);controls.append(b)}const cost=document.createElement('span');const input=document.createElement('input');input.type='number';input.min='0';input.step='0.01';input.placeholder='سجّل الفاتورة';input.value=j.cost_usd??'';const save=document.createElement('button');save.textContent='حفظ';save.onclick=()=>saveCost(j.episode_id,input);cost.append(input,save);return[j.title+' · '+j.episode_id,j.status+' · محاولات '+j.attempts,j.render_progress+'%',cost,controls]}));
 rows($('eps'),['التاريخ','اللغة','العنوان','الحالة','التقدم'],e.episodes.slice(0,20).map(x=>{const b=document.createElement('div');b.className='bar';const i=document.createElement('div');i.style.width=(x.render_progress||0)+'%';b.append(i);const st=document.createElement('div');st.append(el('span',x.status));if(x.render_error)st.append(el('div',x.render_error.slice(0,200),'bad'));return[x.episode_date,x.language,x.title,st,b]}));
 rows($('runs'),['التاريخ','اللغة','الحالة','خطأ'],s.daily_runs.map(r=>[r.run_date,r.language,r.status,r.error]))}catch(x){$('login').hidden=false;$('main').hidden=true;$('err').textContent=sessionStorage.getItem('k')?'مفتاح خاطئ أو APP_API_KEY غير مضبوط':''}}
 if(sessionStorage.getItem('k'))load();setInterval(()=>{if(!$('main').hidden)load()},10000);

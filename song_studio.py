@@ -272,9 +272,11 @@ def make_lyric_image(text, language, path, font_fn, shape_fn):
     image.save(path)
 
 
-async def render_song_video(scenes, timings, song, language, job_dir, output, make_image, make_motion, font_fn, shape_fn, progress, prebuilt_motion=None):
+async def render_song_video(scenes, timings, song, language, job_dir, output, make_image, make_motion, font_fn, shape_fn, progress, prebuilt_motion=None, control=None):
     clips = []
     for index, scene in enumerate(scenes):
+        if control:
+            await control()
         start, end, line_times = timings[index]
         duration = end - start
         key = "chorus" if scene["type"] == "chorus" else index  # repeated chorus reuses one image/clip: saves quota and mirrors real kids songs
