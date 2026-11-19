@@ -11,6 +11,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 - Telegram review uploads larger than 49 MB are compressed into a temporary copy; the original video is retained for YouTube. Use `/review EPISODE_ID` to retry sending an existing video awaiting review.
 - `/status` includes today's generation state (even before a script is saved), render progress and the latest error. `/today` runs without blocking other Telegram commands, and retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
 - Scene artwork and narration are prepared concurrently, with one scene prepared ahead while FFmpeg renders the current scene. Rendering stays sequential to limit CPU use.
+- Set `DAILY_LANGUAGES=ar` for one Arabic episode per day, or `ar,en` for both. `/today` uses the same setting.
 - Stores jobs, generated files, and OAuth token in SQLite/files under `DATA_DIR`.
 
 ## Important limitations
@@ -43,6 +44,8 @@ DAILY_EN_TIME=14:00
 Optional: `BACKGROUND_MUSIC_PATH=/app/data/music/licensed-track.mp3` for music you have rights to use. Without this variable, the video has narration only.
 
 ### AI scene illustrations
+
+For a simple original 3D character instead of generated illustrations, set `VIDEO_PROVIDER=blender`, `CONTENT_MODE=song`, `SONG_PROVIDER=tts`, and `DAILY_LANGUAGES=ar`. Blender renders a short loop once and reuses it across episodes. The character repeats the same movement and does not act out each lyric; this is not full animation or singing. The Docker image includes Blender; rendering and hosting still incur Railway costs. Check actual usage before relying on a monthly budget. Older story episodes cannot be rendered in Blender mode.
 
 1. Create a Cloudflare account and set up Workers AI. In its [REST API setup](https://developers.cloudflare.com/workers-ai/get-started/rest-api/), find the Account ID and create a Workers AI API token with the required permission.
 2. In the Railway service's Variables, set `IMAGE_PROVIDER=cloudflare`, `CLOUDFLARE_ACCOUNT_ID` to the Account ID, and `CLOUDFLARE_API_TOKEN` to the token. Never share or commit the token.
