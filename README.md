@@ -71,6 +71,10 @@ Add a Railway Volume mounted at `/app/data` so the SQLite database, media, and G
 
 Do not send Google passwords, OAuth tokens, or provider keys to anyone. Revoke OAuth access from your Google Account if you need to disconnect the integration; delete `google-token.json` from the Railway Volume to remove the saved token.
 
+### Animated scenes (fal.ai image-to-video)
+
+Set `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=fal` and `FAL_KEY` (from fal.ai dashboard). Each scene image is animated into a 5-second clip (`FAL_VIDEO_MODEL`, default Kling 2.1 standard) that plays forward and backward under the narration. This adds fal.ai cost per scene (about 6 clips per episode); check their pricing. Failures fail the render visibly; completed clips are reused on retry.
+
 ## Schedule and publishing
 
 Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set times appropriate for your audience. The scheduler generates a draft/video at those times, then sends it to Telegram. No video is automatically published without the explicit approval button.
