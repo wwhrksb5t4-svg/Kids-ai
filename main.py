@@ -290,10 +290,10 @@ def character_sheet(story) -> str:
     return sheet[:800]
 
 
-def font(size):
+def font(size, basic=False):
     for name in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"):
         try:
-            return ImageFont.truetype(name, size)
+            return ImageFont.truetype(name, size, layout_engine=ImageFont.Layout.BASIC if basic else None)
         except OSError:
             continue
     return ImageFont.load_default()
@@ -551,7 +551,7 @@ def make_caption_images(narration, language, duration, folder, index):
     groups = [words[i:i + 5] for i in range(0, len(words), 5)] or [[""]]
     total_chars = sum(len(" ".join(g)) for g in groups) or 1
     captions, cursor = [], 0.0
-    caption_font = font(44)
+    caption_font = font(44, basic=True)
     for number, group in enumerate(groups):
         span = duration * len(" ".join(group)) / total_chars
         lines, line = [], ""
@@ -719,15 +719,15 @@ async def pipeline_scenes(scenes, prepare, render):
 blender_lock = asyncio.Lock()
 
 
-async def blender_animation():
-    output = DATA_DIR / "blender-child-v1.mp4"
+async def blender_animation(variant=0):
+    output = DATA_DIR / f"blender-child-v2-{variant}.mp4"
     async with blender_lock:
         if output.is_file() and output.stat().st_size:
             return output
         with tempfile.TemporaryDirectory(prefix="blender-", dir=WORK_DIR) as directory:
             folder = Path(directory)
             commands = [
-                ["blender", "-b", "--threads", "2", "--python", str(ROOT / "blender_character.py"), "--", str(folder)],
+                ["blender", "-b", "--threads", "2", "--python", str(ROOT / "blender_character.py"), "--", str(folder), str(variant)],
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", "12", "-i", str(folder / "frame-%04d.png"),
                  "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", str(folder / "animation.mp4")],
             ]
@@ -774,9 +774,9 @@ async def render_song_episode(episode, scenes, meta, job_dir):
     elif VIDEO_PROVIDER == "hf":
         motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "blender":
-        prebuilt_motion = await blender_animation()
+        prebuilt_motion = [await blender_animation(index) for index in range(3)]
     output = MEDIA_DIR / f"{episode_id}.mp4"
-    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, font, shape_text, progress, prebuilt_motion=prebuilt_motion)
+    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, lambda size: font(size, basic=True), shape_text, progress, prebuilt_motion=prebuilt_motion)
     with db() as con:
         con.execute("UPDATE episodes SET video_path=?,status='ready_for_review',render_progress=100,updated_at=? WHERE id=?", (str(output), utc_now().isoformat(), episode_id))
     return output
@@ -899,7 +899,15 @@ async def create_daily_episode(language: str, run_date: date):
             if CONTENT_MODE == "song":
                 topic = song_studio.SONG_TOPICS[(run_date.toordinal() + (1 if language == "en" else 0)) % len(song_studio.SONG_TOPICS)] if not DAILY_TOPIC else DAILY_TOPIC
                 try:
-                    story = await asyncio.wait_for(song_studio.write_song(client, model, topic, language, recent_titles()), timeout=300)
+                    character_instruction = (
+                        "The main character must be an original young child in a garden. "
+                        "The video shows that child dancing in a garden throughout; do not describe the main character as an animal."
+                        if VIDEO_PROVIDER == "blender" else ""
+                    )
+                    story = await asyncio.wait_for(
+                        song_studio.write_song(client, model, topic, language, recent_titles(), character_instruction=character_instruction),
+                        timeout=300,
+                    )
                 except asyncio.TimeoutError as exc:
                     raise RuntimeError("Timed out while writing the song with FastLLM.") from exc
                 sheet = character_sheet(story)

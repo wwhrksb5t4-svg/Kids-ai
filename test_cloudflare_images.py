@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageFont
 from telegram import Update, User
 from telegram._bot import Bot
 from telegram.ext import Application
@@ -440,6 +440,20 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_arabic_lyric_uses_basic_font_layout(self):
+        used = []
+
+        def capture_font(size):
+            face = main.font(size, basic=True)
+            used.append(face.layout_engine)
+            return face
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lyric.png"
+            main.song_studio.make_lyric_image("سلحفاة سميرة تساعد الأصدقاء", "ar", path, capture_font, main.shape_text)
+            self.assertTrue(path.is_file())
+            self.assertTrue(all(layout == ImageFont.Layout.BASIC for layout in used))
+
     async def test_daily_run_uses_only_configured_language(self):
         create = AsyncMock(return_value={"status": "pending_review", "id": "test"})
         with patch.object(main, "DAILY_LANGUAGES", ("ar",)), \
@@ -464,7 +478,7 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
                  patch.object(main, "make_cloudflare_frame", new_callable=AsyncMock) as cloudflare:
                 await main.render_song_episode(episode, scenes, {}, path)
-                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], path / "loop.mp4")
+                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [path / "loop.mp4"] * 3)
                 cloudflare.assert_not_awaited()
 
 
