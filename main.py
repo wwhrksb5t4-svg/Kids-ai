@@ -22,6 +22,7 @@ from urllib.parse import quote
 import arabic_reshaper
 import edge_tts
 import httpx
+import song_studio
 from bidi.algorithm import get_display
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
@@ -71,6 +72,11 @@ FAL_VIDEO_MODEL = (os.getenv("FAL_VIDEO_MODEL") or "fal-ai/kling-video/v2.1/stan
 HF_SPACE = (os.getenv("HF_SPACE") or "Lightricks/ltx-video-distilled").strip()
 HF_API_NAME = (os.getenv("HF_API_NAME") or "/image_to_video").strip()
 HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
+CONTENT_MODE = (os.getenv("CONTENT_MODE") or "song").strip().strip("'\"").lower()
+SONG_PROVIDER = (os.getenv("SONG_PROVIDER") or "tts").strip().strip("'\"").lower()
+FAL_MUSIC_MODEL = (os.getenv("FAL_MUSIC_MODEL") or "fal-ai/ace-step").strip().strip("/")
+VOICE_SONG_EN = (os.getenv("VOICE_SONG_EN") or "en-US-AnaNeural").strip()
+VOICE_SONG_AR = (os.getenv("VOICE_SONG_AR") or "ar-SA-ZariyahNeural").strip()
 RENDER_RETRY_AFTER = timedelta(minutes=10)
 TELEGRAM_VIDEO_LIMIT = 49_000_000
 TELEGRAM_VIDEO_TARGET = 42_000_000
@@ -103,6 +109,8 @@ def init_db():
             render_progress INTEGER NOT NULL DEFAULT 0, render_error TEXT,
             analytics TEXT, UNIQUE(episode_date, language)
         )""")
+        if "meta" not in [r[1] for r in con.execute("PRAGMA table_info(episodes)")]:
+            con.execute("ALTER TABLE episodes ADD COLUMN meta TEXT")
         con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
             state TEXT PRIMARY KEY, created_at TEXT NOT NULL, code_verifier TEXT
         )""")
@@ -368,13 +376,13 @@ def cloudflare_error(response):
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
-async def make_cloudflare_frame(scene, path):
+async def make_cloudflare_frame(scene, path, size=(720, 1280), style=""):
     description = scene.get("visual_description", "").strip()
     if not description:
         raise RuntimeError("A scene is missing its visual description for image generation.")
     prompt = (
-        "Original child-friendly storybook illustration, bright colors, gentle and safe, "
-        "no text, no logos, no recognizable copyrighted characters. "
+        (style or "Original child-friendly storybook illustration, bright colors, gentle and safe, ")
+        + " no text, no logos, no recognizable copyrighted characters. "
         + str(scene.get("character_sheet", ""))[:800] + " Scene: " + description
     )[:2048]
     body = {"prompt": prompt}
@@ -395,7 +403,7 @@ async def make_cloudflare_frame(scene, path):
         if len(image_bytes) > 20 * 1024 * 1024:
             raise RuntimeError("Cloudflare returned an image that is too large.")
         with Image.open(io.BytesIO(image_bytes)) as image:
-            image = ImageOps.fit(image.convert("RGB"), (720, 1280), method=Image.Resampling.LANCZOS)
+            image = ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS)
     except (ValueError, KeyError, TypeError, binascii.Error, UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
         raise RuntimeError("Cloudflare returned an invalid image response.") from exc
     temporary = path.with_suffix(".tmp")
@@ -406,7 +414,7 @@ async def make_cloudflare_frame(scene, path):
         temporary.unlink(missing_ok=True)
 
 
-async def make_fal_motion(scene, image_path, path):
+async def make_fal_motion(scene, image_path, path, size=(720, 1280)):
     """Animate a scene image into a short looping clip via fal.ai image-to-video."""
     motion = str(scene.get("motion") or scene.get("visual_description") or "").strip()
     prompt = (
@@ -415,7 +423,7 @@ async def make_fal_motion(scene, image_path, path):
     )[:1500]
     data_uri = "data:image/png;base64," + base64.b64encode(image_path.read_bytes()).decode()
     headers = {"Authorization": f"Key {FAL_KEY}"}
-    body = {"prompt": prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": "9:16"}
+    body = {"prompt": prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": "16:9" if size[0] > size[1] else "9:16"}
     try:
         async with httpx.AsyncClient(timeout=120) as http:
             submit = await http.post(f"https://queue.fal.run/{FAL_VIDEO_MODEL}", headers=headers, json=body)
@@ -441,17 +449,17 @@ async def make_fal_motion(scene, image_path, path):
         raise RuntimeError("Could not reach fal.ai; try again.") from exc
     except (KeyError, ValueError, TypeError) as exc:
         raise RuntimeError("fal.ai returned an unexpected response.") from exc
-    await finalize_motion(video.content, path)
+    await finalize_motion(video.content, path, size)
 
 
-async def finalize_motion(raw_bytes, path):
+async def finalize_motion(raw_bytes, path, size=(720, 1280)):
     raw = path.with_suffix(".raw.mp4")
     raw.write_bytes(raw_bytes)
     # Play forward then backward so a 5s clip can loop under longer narration without a visible jump.
     result = await asyncio.to_thread(
         subprocess.run,
         ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-filter_complex",
-         "[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=24,split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]",
+         f"[0:v]scale={size[0]}:{size[1]}:force_original_aspect_ratio=increase,crop={size[0]}:{size[1]},fps=24,split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]",
          "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(path)],
         capture_output=True, text=True, timeout=240,
     )
@@ -460,7 +468,7 @@ async def finalize_motion(raw_bytes, path):
         raise RuntimeError(f"Could not process fal.ai clip: {result.stderr[-300:]}")
 
 
-async def make_hf_motion(scene, image_path, path):
+async def make_hf_motion(scene, image_path, path, size=(720, 1280)):
     """Free image-to-video through a public Hugging Face Space (slow, queued, may fail)."""
     from gradio_client import Client, handle_file
 
@@ -471,7 +479,7 @@ async def make_hf_motion(scene, image_path, path):
         return client.predict(
             prompt=prompt, negative_prompt="worst quality, distorted, text, watermark",
             input_image_filepath=handle_file(str(image_path)), input_video_filepath=None,
-            height_ui=704, width_ui=512, mode="image-to-video", duration_ui=2,
+            height_ui=512 if size[0] > size[1] else 704, width_ui=704 if size[0] > size[1] else 512, mode="image-to-video", duration_ui=2,
             ui_frames_to_use=9, seed_ui=42, randomize_seed=True, ui_guidance_scale=1,
             improve_texture_flag=True, api_name=HF_API_NAME,
         )
@@ -489,7 +497,7 @@ async def make_hf_motion(scene, image_path, path):
             found = item
     if not found:
         raise RuntimeError("Hugging Face Space returned no video.")
-    await finalize_motion(Path(found).read_bytes(), path)
+    await finalize_motion(Path(found).read_bytes(), path, size)
 
 
 def audio_duration(path) -> float:
@@ -676,6 +684,40 @@ async def pipeline_scenes(scenes, prepare, render):
     return clips
 
 
+async def render_song_episode(episode, scenes, meta, job_dir):
+    if IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("Song videos need IMAGE_PROVIDER=cloudflare (3D scene images).")
+    episode_id, language = episode["id"], episode["language"]
+
+    def progress(value):
+        with db() as con:
+            con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (value, utc_now().isoformat(), episode_id))
+
+    progress(2)
+    if SONG_PROVIDER == "fal":
+        if not FAL_KEY:
+            raise RuntimeError("SONG_PROVIDER=fal requires FAL_KEY.")
+        song_file, timings = await song_studio.make_fal_song(scenes, meta.get("music_prompt"), job_dir, FAL_KEY, FAL_MUSIC_MODEL, audio_duration)
+    else:
+        voice = VOICE_SONG_AR if language == "ar" else VOICE_SONG_EN
+        song_file, timings = await song_studio.make_tts_song(scenes, language, job_dir, voice, audio_duration)
+    progress(8)
+
+    async def image(scene, path):
+        await make_cloudflare_frame(scene, path, song_studio.SIZE, song_studio.STYLE_3D + ".")
+
+    motion = None
+    if VIDEO_PROVIDER == "fal":
+        motion = lambda scene, frame, path: make_fal_motion(scene, frame, path, song_studio.SIZE)
+    elif VIDEO_PROVIDER == "hf":
+        motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
+    output = MEDIA_DIR / f"{episode_id}.mp4"
+    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, font, shape_text, progress)
+    with db() as con:
+        con.execute("UPDATE episodes SET video_path=?,status='ready_for_review',render_progress=100,updated_at=? WHERE id=?", (str(output), utc_now().isoformat(), episode_id))
+    return output
+
+
 async def render_video(episode_id: str):
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
@@ -688,6 +730,8 @@ async def render_video(episode_id: str):
         raise RuntimeError("FFmpeg is missing")
     job_dir = WORK_DIR / episode_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    if episode.get("meta") and json.loads(episode["meta"]).get("kind") == "song":
+        return await render_song_episode(episode, scenes, json.loads(episode["meta"]), job_dir)
     voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
@@ -786,22 +830,33 @@ async def create_daily_episode(language: str, run_date: date):
                 model = await asyncio.wait_for(select_model(), timeout=90)
             except asyncio.TimeoutError as exc:
                 raise RuntimeError("Timed out while selecting a text model from FastLLM.") from exc
-            topic = pick_topic(run_date)
-            try:
-                story = await asyncio.wait_for(write_story(topic, language, model, recent_titles()), timeout=300)
-            except asyncio.TimeoutError as exc:
-                raise RuntimeError("Timed out while generating the story from FastLLM.") from exc
-            sheet = character_sheet(story)
-            raw_scenes = story.get("scenes")
-            if not isinstance(raw_scenes, list):
-                raise RuntimeError("The AI did not return scenes")
-            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "motion": str(scene.get("motion", "")).strip(), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
+            if CONTENT_MODE == "song":
+                topic = song_studio.SONG_TOPICS[(run_date.toordinal() + (1 if language == "en" else 0)) % len(song_studio.SONG_TOPICS)] if not DAILY_TOPIC else DAILY_TOPIC
+                try:
+                    story = await asyncio.wait_for(song_studio.write_song(client, model, topic, language, recent_titles()), timeout=300)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("Timed out while writing the song with FastLLM.") from exc
+                sheet = character_sheet(story)
+                scenes = song_studio.normalize_sections(story, sheet)
+                meta = json.dumps({"kind": "song", "music_prompt": str(story.get("music_prompt") or ""), "tags": [str(t)[:30] for t in (story.get("tags") or []) if str(t).strip()][:15], "lyrics": song_studio.lyrics_text(scenes)}, ensure_ascii=False)
+            else:
+                meta = None
+                topic = pick_topic(run_date)
+                try:
+                    story = await asyncio.wait_for(write_story(topic, language, model, recent_titles()), timeout=300)
+                except asyncio.TimeoutError as exc:
+                    raise RuntimeError("Timed out while generating the story from FastLLM.") from exc
+                sheet = character_sheet(story)
+                raw_scenes = story.get("scenes")
+                if not isinstance(raw_scenes, list):
+                    raise RuntimeError("The AI did not return scenes")
+                scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "motion": str(scene.get("motion", "")).strip(), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
             if not scenes:
                 raise RuntimeError("The AI returned empty narration")
             episode_id = str(uuid.uuid4())
             timestamp = utc_now().isoformat()
             with db() as con:
-                con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, topic, str(story.get("title") or topic)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model))
+                con.execute("INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (episode_id, run_key, language, topic, str(story.get("title") or topic)[:180], str(story.get("description") or "An original Kids Haven adventure")[:3000], "\n\n".join(scene["narration"] for scene in scenes), json.dumps(scenes, ensure_ascii=False), "rendering", timestamp, timestamp, model, meta))
                 con.execute("UPDATE daily_runs SET status='rendering' WHERE run_date=? AND language=?", (run_key, language))
         await render_video(episode_id)
         with db() as con:
@@ -893,7 +948,10 @@ async def publish_episode(episode_id: str):
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
     if not row or not row["video_path"] or not Path(row["video_path"]).is_file():
         raise RuntimeError("Episode video file is missing")
-    snippet = {"title": row["title"][:100], "description": (row["description"] + "\n\n#KidsHaven #KidsStories").strip()[:5000], "tags": ["Kids Haven", "children stories", "kids cartoon", "bedtime stories"], "categoryId": "1"}
+    meta = json.loads(row["meta"]) if row["meta"] else {}
+    tags = ["Kids Haven", "nursery rhymes", "kids songs", "children songs", "cartoon for kids"] + list(meta.get("tags") or [])
+    lyrics = ("\n\nLyrics:\n" + meta["lyrics"]) if meta.get("lyrics") else ""
+    snippet = {"title": row["title"][:100], "description": (row["description"] + lyrics + "\n\n#KidsHaven #NurseryRhymes #KidsSongs").strip()[:4900], "tags": tags[:25], "categoryId": "1"}
     body = {"snippet": snippet, "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": True}}
     media = MediaFileUpload(row["video_path"], mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024)
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)

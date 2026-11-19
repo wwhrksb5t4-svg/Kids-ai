@@ -77,6 +77,15 @@ Set `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=fal` and `FAL_KEY` (from fal.ai
 
 Free option: `VIDEO_PROVIDER=hf` animates scenes through a public Hugging Face Space (`HF_SPACE`, `HF_API_NAME`, optional `HF_TOKEN` for a better free quota). It is slow, queued and unreliable; any scene that fails falls back to the zoom animation. The default Space's API arguments are unverified and may change, so test with `/today`.
 
+## Song mode (default): original kids-song music videos
+
+`CONTENT_MODE=song` (default) makes 16:9 sing-along videos of about 1-2 minutes, modelled on what top nursery-rhyme channels do: one recurring cute character, simple AABB rhymes, a chorus repeated 3 times, bright glossy 3D-style scenes and big on-screen lyrics. Songs are original; no existing franchise or song is copied. Set `CONTENT_MODE=story` for the previous narrated stories.
+
+- Recommended settings: `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=hf` (free) or `fal` (paid, better), `SONG_PROVIDER=tts` (free) or `fal` (real AI-sung track with `FAL_KEY`).
+- `tts` is a child-like voice reading each line on a beat over a synthesized backing: it is not real singing. For a sung vocal use `SONG_PROVIDER=fal` (ACE-Step on fal.ai; unverified request schema, set `FAL_MUSIC_MODEL` if needed). With `fal`, lyric timing across scenes is approximate.
+- YouTube upload adds lyrics, tags and kids-song hashtags. Review every video first; AI images and voices can be flawed.
+- Honest limits: 3D look comes from AI images plus short image-to-video clips, not a studio animation pipeline; matching CoComelon quality is not realistic.
+
 ## Schedule and publishing
 
 Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set times appropriate for your audience. The scheduler generates a draft/video at those times, then sends it to Telegram. No video is automatically published without the explicit approval button.
