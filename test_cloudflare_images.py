@@ -3,7 +3,9 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -53,7 +55,7 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
     async def test_failed_or_invalid_responses_are_reported(self):
         real_client = httpx.AsyncClient
         for response, message in (
-            (httpx.Response(429), "HTTP 429"),
+            (httpx.Response(429), "quota is exhausted"),
             (httpx.Response(200, json={"success": True, "result": {"image": "not-base64"}}), "invalid image response"),
             (httpx.Response(200, json={"success": False}), "no Cloudflare error code"),
         ):
@@ -241,6 +243,109 @@ class IdeaEpisodeStorageTest(unittest.TestCase):
                         )
 
 
+class StudioSettingsTest(unittest.TestCase):
+    def test_provider_settings_persist_and_validate_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.sqlite3"
+            with patch.object(main, "DB_PATH", path), \
+                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
+                 patch.object(main, "VIDEO_PROVIDER", "none"), \
+                 patch.object(main, "SONG_PROVIDER", "tts"), \
+                 patch.object(main, "CONTENT_MODE", "story"):
+                main.init_db()
+                main.set_studio_settings({"image_provider": "cards", "content_mode": "story"})
+                main.load_studio_settings()
+                self.assertEqual(main.CONTENT_MODE, "story")
+                with patch.object(main, "CLOUDFLARE_ACCOUNT_ID", ""), patch.object(main, "CLOUDFLARE_API_TOKEN", ""):
+                    with self.assertRaisesRegex(ValueError, "Cloudflare غير جاهز"):
+                        main.set_studio_settings({"image_provider": "cloudflare"})
+                self.assertEqual(main.IMAGE_PROVIDER, "cards")
+
+    def test_song_mode_rejects_unavailable_visual_pipeline(self):
+        values = {
+            "image_provider": "cards",
+            "video_provider": "none",
+            "song_provider": "tts",
+            "content_mode": "song",
+        }
+        with self.assertRaisesRegex(ValueError, "وضع الأغاني يحتاج"):
+            main.validate_studio_settings(values)
+
+
+class YouTubePublishingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_scheduled_publish_is_private_until_requested_time_and_uploads_thumbnail(self):
+        class Request:
+            def __init__(self, value):
+                self.value = value
+
+            def execute(self):
+                return self.value
+
+        class YouTube:
+            def __init__(self):
+                self.insert_args = None
+                self.thumbnail_args = None
+
+            def videos(self):
+                owner = self
+                class Videos:
+                    def insert(self, **kwargs):
+                        owner.insert_args = kwargs
+                        return Request({"id": "youtube-id"})
+
+                return Videos()
+
+            def thumbnails(self):
+                owner = self
+                class Thumbnails:
+                    def set(self, **kwargs):
+                        owner.thumbnail_args = kwargs
+                        return Request({})
+
+                return Thumbnails()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            db_path, media = root / "publish.sqlite3", root / "media"
+            media.mkdir()
+            video, thumbnail = root / "video.mp4", media / "episode-id-thumbnail.jpg"
+            video.write_bytes(b"mp4")
+            thumbnail.write_bytes(b"jpeg")
+            youtube = YouTube()
+            with patch.object(main, "DB_PATH", db_path), patch.object(main, "MEDIA_DIR", media):
+                main.init_db()
+                with main.db() as con:
+                    con.execute(
+                        "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,video_path,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("episode-id", "2026-11-19", "ar", "topic", "title", "", "", "[]", "ready_for_review", str(video), "now", "now", "idea"),
+                    )
+                with patch.object(main, "youtube_services", return_value=(youtube, None)):
+                    at = main.utc_now().replace(microsecond=0) + main.timedelta(hours=2)
+                    link = await main.publish_episode("episode-id", publish_at=at)
+                self.assertEqual(youtube.insert_args["body"]["status"]["privacyStatus"], "private")
+                self.assertEqual(youtube.insert_args["body"]["status"]["publishAt"], at.isoformat().replace("+00:00", "Z"))
+                self.assertEqual(youtube.thumbnail_args["videoId"], "youtube-id")
+                self.assertIn("youtube-id", link)
+                with main.db() as con:
+                    self.assertEqual(con.execute("SELECT status FROM episodes WHERE id='episode-id'").fetchone()["status"], "scheduled")
+
+    async def test_thumbnail_is_1280_by_720_and_under_upload_limit(self):
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg is required for thumbnail extraction")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, thumbnail = root / "source.mp4", root / "thumb.jpg"
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=skyblue:s=720x1280:d=2",
+                 "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-y", str(video)],
+                check=True,
+            )
+            result = main.create_video_thumbnail(video, "طفل يتعلم الألوان", "ar", thumbnail)
+            with Image.open(result) as image:
+                self.assertEqual(image.size, (1280, 720))
+            self.assertLess(thumbnail.stat().st_size, 2_000_000)
+
+
 class IdeaDraftTest(unittest.IsolatedAsyncioTestCase):
     async def test_telegram_setup_collects_choices_before_preview(self):
         message = SimpleNamespace(text="تعلم الألوان مع طفلة وقطتها", reply_text=AsyncMock())
@@ -310,14 +415,61 @@ class IdeaDraftTest(unittest.IsolatedAsyncioTestCase):
                 report = AsyncMock()
                 with patch.object(main, "VIDEO_PROVIDER", "none"), \
                      patch.object(main, "render_video", side_effect=render) as render_video, \
-                     patch.object(main, "send_episode_for_review", new_callable=AsyncMock) as send:
+                     patch.object(main, "send_episode_for_review", new_callable=AsyncMock) as send, \
+                     patch.object(main, "notify_admin", new_callable=AsyncMock) as notify:
                     await main.produce_idea_episode("idea-id", report)
+                    with main.db() as con:
+                        self.assertEqual(con.execute("SELECT status FROM episodes WHERE id='idea-id'").fetchone()["status"], "queued")
+                    await main.process_production_job("idea-id")
                     await main.produce_idea_episode("idea-id", report)
                 self.assertEqual(render_video.await_count, 1)
                 send.assert_awaited_once_with("idea-id")
                 with main.db() as con:
                     self.assertEqual(con.execute("SELECT status FROM episodes WHERE id='idea-id'").fetchone()["status"], "ready_for_review")
-                self.assertTrue(any("YouTube" in call.args[0] for call in report.await_args_list))
+                    self.assertEqual(con.execute("SELECT status FROM production_jobs WHERE episode_id='idea-id'").fetchone()["status"], "completed")
+                self.assertTrue(any("YouTube" in call.args[0] for call in notify.await_args_list))
+
+    async def test_paused_worker_waits_and_cancelled_job_raises(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.sqlite3"
+            with patch.object(main, "DB_PATH", path):
+                main.init_db()
+                with main.db() as con:
+                    con.execute(
+                        "INSERT INTO production_jobs(id,episode_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        ("job", "job", "paused", "now", "now"),
+                    )
+                waiting = asyncio.create_task(main.wait_for_production_job("job"))
+                await asyncio.sleep(0)
+                self.assertFalse(waiting.done())
+                with main.db() as con:
+                    con.execute("UPDATE production_jobs SET status='running' WHERE episode_id='job'")
+                await asyncio.wait_for(waiting, timeout=2)
+                with main.db() as con:
+                    con.execute("UPDATE production_jobs SET status='cancelled' WHERE episode_id='job'")
+                with self.assertRaises(main.ProductionCancelled):
+                    await main.wait_for_production_job("job")
+
+    async def test_resume_requeues_paused_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "resume.sqlite3"
+            with patch.object(main, "DB_PATH", path), \
+                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
+                 patch.object(main, "VIDEO_PROVIDER", "none"):
+                main.init_db()
+                with main.db() as con:
+                    con.execute(
+                        "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("resume-id", "2026-11-19", "ar", "idea", "title", "", "", "[]", "paused", "now", "now", "idea"),
+                    )
+                    con.execute(
+                        "INSERT INTO production_jobs(id,episode_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+                        ("resume-id", "resume-id", "paused", "now", "now"),
+                    )
+                await main.produce_idea_episode("resume-id", AsyncMock())
+                with main.db() as con:
+                    self.assertEqual(con.execute("SELECT status FROM episodes WHERE id='resume-id'").fetchone()["status"], "queued")
+                    self.assertEqual(con.execute("SELECT status FROM production_jobs WHERE episode_id='resume-id'").fetchone()["status"], "queued")
 
 
 class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):
@@ -619,7 +771,8 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(main, "db"), \
                  patch.object(main, "blender_animation", side_effect=animation) as generate, \
                  patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
-                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render:
+                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
+                 patch.object(main, "create_video_thumbnail"):
                 await main.render_song_episode(episode, scenes, {}, path)
                 self.assertEqual([call.args[0] for call in generate.await_args_list], [1, 2, 3])
                 self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [
@@ -662,6 +815,7 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(main, "blender_animation", new_callable=AsyncMock, return_value=path / "loop.mp4"), \
                  patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
                  patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
+                 patch.object(main, "create_video_thumbnail"), \
                  patch.object(main, "make_cloudflare_frame", new_callable=AsyncMock) as cloudflare:
                 await main.render_song_episode(episode, scenes, {}, path)
                 self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [path / "loop.mp4"])
