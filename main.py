@@ -65,6 +65,12 @@ BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
 IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
 CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
 CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
+VIDEO_PROVIDER = (os.getenv("VIDEO_PROVIDER") or "none").strip().lower()
+FAL_KEY = (os.getenv("FAL_KEY") or "").strip()
+FAL_VIDEO_MODEL = (os.getenv("FAL_VIDEO_MODEL") or "fal-ai/kling-video/v2.1/standard/image-to-video").strip().strip("/")
+HF_SPACE = (os.getenv("HF_SPACE") or "Lightricks/ltx-video-distilled").strip()
+HF_API_NAME = (os.getenv("HF_API_NAME") or "/image_to_video").strip()
+HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 RENDER_RETRY_AFTER = timedelta(minutes=10)
 TELEGRAM_VIDEO_LIMIT = 49_000_000
 TELEGRAM_VIDEO_TARGET = 42_000_000
@@ -217,7 +223,7 @@ async def write_story(topic: str, language: str, model: str, avoid_titles=()):
         "Keep character names and events aligned between language versions. "
         "Return JSON with: title, description, moral, art_style (one English sentence describing a single consistent visual style), "
         "characters (1-3 objects with name and appearance; appearance is a detailed English description of face, colors and clothing), "
-        "and scenes: exactly 6 objects, each having visual_description, narration, sound_effect. "
+        "and scenes: exactly 6 objects, each having visual_description, motion (one English sentence describing the characters' movement), narration, sound_effect. "
         "Write approximately 55 spoken words in each scene's narration; do not count other fields. "
         "Write each visual_description in English as a self-contained illustration prompt that names the characters present, the place and the action. "
         f"Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
@@ -318,6 +324,12 @@ def make_frame(scene, path, index, total, language):
 
 
 def check_image_provider():
+    if VIDEO_PROVIDER not in ("none", "fal", "hf"):
+        raise RuntimeError("VIDEO_PROVIDER must be none, fal or hf.")
+    if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
+    if VIDEO_PROVIDER == "fal" and not FAL_KEY:
+        raise RuntimeError("VIDEO_PROVIDER=fal requires FAL_KEY.")
     if IMAGE_PROVIDER not in ("cards", "cloudflare"):
         raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
     if IMAGE_PROVIDER == "cloudflare" and not (
@@ -392,6 +404,92 @@ async def make_cloudflare_frame(scene, path):
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+async def make_fal_motion(scene, image_path, path):
+    """Animate a scene image into a short looping clip via fal.ai image-to-video."""
+    motion = str(scene.get("motion") or scene.get("visual_description") or "").strip()
+    prompt = (
+        "Smooth 3D animated children's cartoon, characters move gently and happily, subtle camera motion, "
+        "no text, no logos. " + str(scene.get("character_sheet", ""))[:500] + " Action: " + motion
+    )[:1500]
+    data_uri = "data:image/png;base64," + base64.b64encode(image_path.read_bytes()).decode()
+    headers = {"Authorization": f"Key {FAL_KEY}"}
+    body = {"prompt": prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": "9:16"}
+    try:
+        async with httpx.AsyncClient(timeout=120) as http:
+            submit = await http.post(f"https://queue.fal.run/{FAL_VIDEO_MODEL}", headers=headers, json=body)
+            submit.raise_for_status()
+            job = submit.json()
+            deadline = asyncio.get_running_loop().time() + 600
+            while True:
+                status = (await http.get(job["status_url"], headers=headers)).json()
+                if status.get("status") == "COMPLETED":
+                    break
+                if status.get("status") not in ("IN_QUEUE", "IN_PROGRESS"):
+                    raise RuntimeError(f"fal.ai video generation failed: {str(status)[:300]}")
+                if asyncio.get_running_loop().time() > deadline:
+                    raise RuntimeError("fal.ai video generation timed out.")
+                await asyncio.sleep(5)
+            result = await http.get(job["response_url"], headers=headers)
+            result.raise_for_status()
+            video = await http.get(result.json()["video"]["url"])
+            video.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"fal.ai request failed (HTTP {exc.response.status_code}): {exc.response.text[:300]}") from exc
+    except httpx.RequestError as exc:
+        raise RuntimeError("Could not reach fal.ai; try again.") from exc
+    except (KeyError, ValueError, TypeError) as exc:
+        raise RuntimeError("fal.ai returned an unexpected response.") from exc
+    await finalize_motion(video.content, path)
+
+
+async def finalize_motion(raw_bytes, path):
+    raw = path.with_suffix(".raw.mp4")
+    raw.write_bytes(raw_bytes)
+    # Play forward then backward so a 5s clip can loop under longer narration without a visible jump.
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw), "-filter_complex",
+         "[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=24,split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[v]",
+         "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(path)],
+        capture_output=True, text=True, timeout=240,
+    )
+    raw.unlink(missing_ok=True)
+    if result.returncode:
+        raise RuntimeError(f"Could not process fal.ai clip: {result.stderr[-300:]}")
+
+
+async def make_hf_motion(scene, image_path, path):
+    """Free image-to-video through a public Hugging Face Space (slow, queued, may fail)."""
+    from gradio_client import Client, handle_file
+
+    prompt = ("Smooth 3D animated children's cartoon, gentle character movement. " + str(scene.get("motion") or scene.get("visual_description") or ""))[:500]
+
+    def run():
+        client = Client(HF_SPACE, hf_token=HF_TOKEN or None)
+        return client.predict(
+            prompt=prompt, negative_prompt="worst quality, distorted, text, watermark",
+            input_image_filepath=handle_file(str(image_path)), input_video_filepath=None,
+            height_ui=704, width_ui=512, mode="image-to-video", duration_ui=2,
+            ui_frames_to_use=9, seed_ui=42, randomize_seed=True, ui_guidance_scale=1,
+            improve_texture_flag=True, api_name=HF_API_NAME,
+        )
+
+    result = await asyncio.wait_for(asyncio.to_thread(run), timeout=900)
+    found = None
+    stack = [result]
+    while stack and not found:
+        item = stack.pop(0)
+        if isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, str) and item.lower().endswith((".mp4", ".webm")) and os.path.isfile(item):
+            found = item
+    if not found:
+        raise RuntimeError("Hugging Face Space returned no video.")
+    await finalize_motion(Path(found).read_bytes(), path)
 
 
 def audio_duration(path) -> float:
@@ -487,11 +585,13 @@ def make_sparkle(path):
     image.save(path)
 
 
-def animated_video_filter(index, sparkle_input, caption_input=None, captions=()):
+def animated_video_filter(index, sparkle_input, caption_input=None, captions=(), motion=False):
     # Alternate zoom-in / zoom-out per scene, with gentle sway, drifting bubbles and a fade-in.
     zoom = "min(1.10+0.0007*on,1.22)" if index % 2 == 0 else "max(1.22-0.0007*on,1.10)"
+    base = "[0:v]format=yuv420p[base]" if motion else (
+        "[0:v]scale=1080:1920,zoompan=z='%s':x='iw/2-(iw/zoom/2)+30*sin(on/20)':y='ih/2-(ih/zoom/2)+20*cos(on/27)':d=1:s=720x1280:fps=24,format=yuv420p[base]" % zoom)
     graph = [
-        "[0:v]scale=1080:1920,zoompan=z='%s':x='iw/2-(iw/zoom/2)+30*sin(on/20)':y='ih/2-(ih/zoom/2)+20*cos(on/27)':d=1:s=720x1280:fps=24,format=yuv420p[base]" % zoom,
+        base,
         "[%d:v]format=rgba,split=6%s" % (sparkle_input, "".join(f"[s{i}]" for i in range(6))),
     ]
     previous = "base"
@@ -519,11 +619,20 @@ def animated_video_filter(index, sparkle_input, caption_input=None, captions=())
 async def prepare_scene(scene, index, total, language, voice, job_dir):
     frame = job_dir / (f"artwork-{index}.png" if IMAGE_PROVIDER == "cloudflare" else f"scene-{index}.png")
     audio = job_dir / f"voice-{index}.mp3"
+    motion = job_dir / f"motion-{index}.mp4"
 
     async def prepare_image():
         if IMAGE_PROVIDER == "cloudflare":
             if not frame.exists():
                 await make_cloudflare_frame(scene, frame)
+            if VIDEO_PROVIDER == "fal" and not motion.exists():
+                await make_fal_motion(scene, frame, motion)
+            elif VIDEO_PROVIDER == "hf" and not motion.exists():
+                try:
+                    await make_hf_motion(scene, frame, motion)
+                except Exception as exc:
+                    # Free Spaces are unreliable: fall back to the zoom animation for this scene.
+                    print(f"HF motion failed for scene {index+1}, using zoom: {exc}", flush=True)
         else:
             await asyncio.to_thread(make_frame, scene, frame, index, total, language)
 
@@ -593,7 +702,11 @@ async def render_video(episode_id: str):
         clip = job_dir / f"clip-{index}.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
+        use_motion = VIDEO_PROVIDER in ("fal", "hf") and (job_dir / f"motion-{index}.mp4").exists()
+        if use_motion:
+            command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(job_dir / f"motion-{index}.mp4"), "-i", str(audio)]
+        else:
+            command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music)]
         if IMAGE_PROVIDER == "cloudflare":
@@ -606,7 +719,10 @@ async def render_video(episode_id: str):
             playlist = job_dir / f"captions-{index}.txt"
             write_caption_playlist(captions, playlist)
             command += ["-f", "concat", "-safe", "1", "-i", str(playlist)]
-            filters = [animated_video_filter(index, sparkle_input, 4, captions)]
+            if use_motion:
+                filters = [animated_video_filter(index, sparkle_input, 4, captions, motion=True)]
+            else:
+                filters = [animated_video_filter(index, sparkle_input, 4, captions)]
             video_map = "[vout]"
         else:
             filters = ["[0:v]scale=720:1280,format=yuv420p[vout]"]
@@ -679,7 +795,7 @@ async def create_daily_episode(language: str, run_date: date):
             raw_scenes = story.get("scenes")
             if not isinstance(raw_scenes, list):
                 raise RuntimeError("The AI did not return scenes")
-            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
+            scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "motion": str(scene.get("motion", "")).strip(), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
             if not scenes:
                 raise RuntimeError("The AI returned empty narration")
             episode_id = str(uuid.uuid4())
