@@ -439,5 +439,34 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
                 con.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
 
 
+class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_run_uses_only_configured_language(self):
+        create = AsyncMock(return_value={"status": "pending_review", "id": "test"})
+        with patch.object(main, "DAILY_LANGUAGES", ("ar",)), \
+             patch.object(main, "create_daily_episode", create), \
+             patch.object(main, "send_episode_for_review", new_callable=AsyncMock) as send:
+            await main.run_today(AsyncMock())
+        self.assertEqual(create.await_count, 1)
+        self.assertEqual(create.await_args.args[0], "ar")
+        send.assert_awaited_once_with("test")
+
+    async def test_blender_song_does_not_request_cloudflare(self):
+        episode = {"id": "test", "language": "ar"}
+        scenes = [{"type": "verse", "lines": ["hello"]}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with patch.object(main, "VIDEO_PROVIDER", "blender"), \
+                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
+                 patch.object(main, "SONG_PROVIDER", "tts"), \
+                 patch.object(main, "db") as db, \
+                 patch.object(main, "blender_animation", new_callable=AsyncMock, return_value=path / "loop.mp4"), \
+                 patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
+                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
+                 patch.object(main, "make_cloudflare_frame", new_callable=AsyncMock) as cloudflare:
+                await main.render_song_episode(episode, scenes, {}, path)
+                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], path / "loop.mp4")
+                cloudflare.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

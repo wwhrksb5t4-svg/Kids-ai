@@ -57,6 +57,9 @@ GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
 GOOGLE_REDIRECT_URI = (os.getenv("GOOGLE_REDIRECT_URI") or (PUBLIC_BASE_URL + "/youtube/oauth/callback" if PUBLIC_BASE_URL else "")).strip()
 DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
+DAILY_LANGUAGES = tuple(part.strip().lower() for part in (os.getenv("DAILY_LANGUAGES") or "ar,en").split(","))
+if not DAILY_LANGUAGES or any(part not in ("ar", "en") for part in DAILY_LANGUAGES) or len(set(DAILY_LANGUAGES)) != len(DAILY_LANGUAGES):
+    raise ValueError("DAILY_LANGUAGES must contain ar, en, or ar,en without duplicates.")
 DAILY_TOPIC = (os.getenv("DAILY_TOPIC") or "").strip()
 VOICE_AR = (os.getenv("VOICE_AR") or "ar-SA-HamedNeural").strip()
 VOICE_EN = (os.getenv("VOICE_EN") or "en-US-GuyNeural").strip()
@@ -332,8 +335,10 @@ def make_frame(scene, path, index, total, language):
 
 
 def check_image_provider():
-    if VIDEO_PROVIDER not in ("none", "fal", "hf"):
-        raise RuntimeError(f"VIDEO_PROVIDER must be none, fal or hf (got {VIDEO_PROVIDER!r}).")
+    if VIDEO_PROVIDER not in ("none", "fal", "hf", "blender"):
+        raise RuntimeError(f"VIDEO_PROVIDER must be none, fal, hf or blender (got {VIDEO_PROVIDER!r}).")
+    if VIDEO_PROVIDER == "blender":
+        return
     if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
         raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
     if VIDEO_PROVIDER == "fal" and not FAL_KEY:
@@ -711,8 +716,37 @@ async def pipeline_scenes(scenes, prepare, render):
     return clips
 
 
+blender_lock = asyncio.Lock()
+
+
+async def blender_animation():
+    output = DATA_DIR / "blender-child-v1.mp4"
+    async with blender_lock:
+        if output.is_file() and output.stat().st_size:
+            return output
+        with tempfile.TemporaryDirectory(prefix="blender-", dir=WORK_DIR) as directory:
+            folder = Path(directory)
+            commands = [
+                ["blender", "-b", "--threads", "2", "--python", str(ROOT / "blender_character.py"), "--", str(folder)],
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", "12", "-i", str(folder / "frame-%04d.png"),
+                 "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", str(folder / "animation.mp4")],
+            ]
+            for command in commands:
+                try:
+                    result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=600)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(f"{command[0]} is not installed.") from exc
+                if result.returncode:
+                    raise RuntimeError(f"{command[0]} failed (exit {result.returncode}): {result.stderr[-500:]}")
+            clip = folder / "animation.mp4"
+            if not clip.is_file() or not clip.stat().st_size:
+                raise RuntimeError("Blender animation was not created.")
+            clip.replace(output)
+    return output
+
+
 async def render_song_episode(episode, scenes, meta, job_dir):
-    if IMAGE_PROVIDER != "cloudflare":
+    if IMAGE_PROVIDER != "cloudflare" and VIDEO_PROVIDER != "blender":
         raise RuntimeError("Song videos need IMAGE_PROVIDER=cloudflare (3D scene images).")
     episode_id, language = episode["id"], episode["language"]
 
@@ -734,12 +768,15 @@ async def render_song_episode(episode, scenes, meta, job_dir):
         await make_cloudflare_frame(scene, path, song_studio.SIZE, song_studio.STYLE_3D + ".")
 
     motion = None
+    prebuilt_motion = None
     if VIDEO_PROVIDER == "fal":
         motion = lambda scene, frame, path: make_fal_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "hf":
         motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
+    elif VIDEO_PROVIDER == "blender":
+        prebuilt_motion = await blender_animation()
     output = MEDIA_DIR / f"{episode_id}.mp4"
-    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, font, shape_text, progress)
+    await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, font, shape_text, progress, prebuilt_motion=prebuilt_motion)
     with db() as con:
         con.execute("UPDATE episodes SET video_path=?,status='ready_for_review',render_progress=100,updated_at=? WHERE id=?", (str(output), utc_now().isoformat(), episode_id))
     return output
@@ -759,6 +796,8 @@ async def render_video(episode_id: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     if episode.get("meta") and json.loads(episode["meta"]).get("kind") == "song":
         return await render_song_episode(episode, scenes, json.loads(episode["meta"]), job_dir)
+    if VIDEO_PROVIDER == "blender":
+        raise RuntimeError("VIDEO_PROVIDER=blender currently supports song episodes only; use CONTENT_MODE=song.")
     voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
@@ -996,8 +1035,8 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
     await update.message.reply_text(
-        "أهلًا بك في Kids Haven Studio.\n/connect — ربط قناة YouTube\n/today — إنشاء النسختين الآن\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nسيتم إنشاء فيديو عربي وآخر إنجليزي يوميًا. كل فيديو يحتاج موافقتك قبل النشر العام.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 إنشاء حلقتَي اليوم", callback_data="generate:today")]]),
+        "أهلًا بك في Kids Haven Studio.\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nكل فيديو يحتاج موافقتك قبل النشر العام.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")]]),
     )
 
 
@@ -1033,7 +1072,7 @@ async def run_today(report):
         return False
     async with generation_lock:
         today = utc_now().date()
-        for language in ("ar", "en"):
+        for language in DAILY_LANGUAGES:
             try:
                 row = await create_daily_episode(language, today)
                 if row.get("status") in ("pending_review", "ready_for_review"):
@@ -1047,9 +1086,9 @@ async def create_today(message):
     if generation_lock.locked():
         await message.reply_text("هناك عملية إنشاء جارية الآن. أرسل /status لمتابعتها.")
         return
-    await message.reply_text("بدأ إنشاء حلقتين. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
+    await message.reply_text("بدأ إنشاء حلقات اليوم. سأرسل كل فيديو هنا للمراجعة قبل النشر.")
     if await run_today(message.reply_text):
-        await message.reply_text("انتهت محاولة إنشاء حلقتَي اليوم. أرسل /status لمعرفة النتيجة.")
+        await message.reply_text("انتهت محاولة إنشاء حلقات اليوم. أرسل /status لمعرفة النتيجة.")
 
 
 async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1140,6 +1179,8 @@ async def scheduler_loop():
         try:
             now = utc_now()
             for language, time_text in (("ar", DAILY_AR_TIME), ("en", DAILY_EN_TIME)):
+                if language not in DAILY_LANGUAGES:
+                    continue
                 try:
                     hour, minute = map(int, time_text.split(":"))
                 except ValueError:
@@ -1265,6 +1306,8 @@ async def web_status(x_api_key: Optional[str] = Header(default=None)):
         "daily_runs": runs,
         "settings": {
             "image_provider": IMAGE_PROVIDER,
+            "video_provider": VIDEO_PROVIDER,
+            "daily_languages": list(DAILY_LANGUAGES),
             "daily_ar_time": DAILY_AR_TIME,
             "daily_en_time": DAILY_EN_TIME,
             "fastllm": bool(client),
@@ -1298,7 +1341,7 @@ DASHBOARD_HTML = """<!doctype html><html lang='ar' dir='rtl'><meta charset='utf-
 .bar{background:#334155;border-radius:6px;height:10px;overflow:hidden}.bar>div{background:#38bdf8;height:100%}table{width:100%;border-collapse:collapse}td,th{padding:6px;text-align:start;border-bottom:1px solid #334155;font-size:14px}</style>
 <h1>🌊 لوحة تحكم Kids Haven</h1>
 <div class='card' id='login'><input id='key' type='password' placeholder='APP_API_KEY'> <button onclick='save()'>دخول</button> <span id='err' class='bad'></span></div>
-<div id='main' hidden><div class='card'><button id='gen' onclick='gen()'>🎬 توليد حلقتَي اليوم الآن</button> <span id='genmsg'></span></div><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
+<div id='main' hidden><div class='card'><button id='gen' onclick='gen()'>🎬 توليد حلقات اليوم الآن</button> <span id='genmsg'></span></div><div class='card'><b>الإعدادات</b><div class='grid' id='settings'></div></div>
 <div class='card'><b>الحلقات</b><div class='grid' id='counts'></div></div>
 <div class='card'><b>آخر الحلقات</b><table id='eps'></table></div>
 <div class='card'><b>التشغيل اليومي</b><table id='runs'></table></div></div>
