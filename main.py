@@ -65,7 +65,7 @@ BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
 IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
 CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
 CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
-VIDEO_PROVIDER = (os.getenv("VIDEO_PROVIDER") or "none").strip().lower()
+VIDEO_PROVIDER = {"huggingface": "hf", "fal.ai": "fal", "": "none"}.get((os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower(), (os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower())
 FAL_KEY = (os.getenv("FAL_KEY") or "").strip()
 FAL_VIDEO_MODEL = (os.getenv("FAL_VIDEO_MODEL") or "fal-ai/kling-video/v2.1/standard/image-to-video").strip().strip("/")
 HF_SPACE = (os.getenv("HF_SPACE") or "Lightricks/ltx-video-distilled").strip()
@@ -325,7 +325,7 @@ def make_frame(scene, path, index, total, language):
 
 def check_image_provider():
     if VIDEO_PROVIDER not in ("none", "fal", "hf"):
-        raise RuntimeError("VIDEO_PROVIDER must be none, fal or hf.")
+        raise RuntimeError(f"VIDEO_PROVIDER must be none, fal or hf (got {VIDEO_PROVIDER!r}).")
     if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
         raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
     if VIDEO_PROVIDER == "fal" and not FAL_KEY:
