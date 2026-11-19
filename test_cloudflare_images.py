@@ -440,10 +440,23 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
 
 
 class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_song_writer_requests_supported_visual_actions(self):
+        song = {"sections": [
+            {"lines": ["one two three four five"] * 3, "visual_description": "garden", "blender_action": "wave"}
+            for _ in range(6)
+        ]}
+        create = AsyncMock(return_value=SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(song)))]
+        ))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        result = await main.song_studio.write_song(client, "model", "colors", "ar", character_instruction="original child")
+        self.assertIn("blender_action", create.await_args.kwargs["messages"][1]["content"])
+        self.assertEqual(main.song_studio.blender_action_indices(main.song_studio.normalize_sections(result, "")), [1] * 6)
+
     async def test_old_animation_cache_is_replaced_and_new_cache_reused(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / "blender-child-v2-0.mp4").write_bytes(b"old")
+            (path / "blender-child-v3-0.mp4").write_bytes(b"old")
 
             def render(command, **kwargs):
                 if command[0] == "ffmpeg":
@@ -458,6 +471,30 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first.read_bytes(), b"new")
             self.assertEqual(second, first)
             self.assertEqual(run.call_count, 2)
+
+    async def test_sections_choose_supported_actions_and_reuse_loops(self):
+        song = {"sections": [
+            {"lines": ["one", "two"], "visual_description": "garden", "blender_action": action}
+            for action in ("wave", "clap", "wave", "invalid")
+        ]}
+        scenes = main.song_studio.normalize_sections(song, "")
+        self.assertEqual(main.song_studio.blender_action_indices(scenes), [1, 2, 1, 3])
+        episode = {"id": "test", "language": "ar"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            async def animation(index):
+                return path / f"loop-{index}.mp4"
+            with patch.object(main, "VIDEO_PROVIDER", "blender"), \
+                 patch.object(main, "SONG_PROVIDER", "tts"), \
+                 patch.object(main, "db"), \
+                 patch.object(main, "blender_animation", side_effect=animation) as generate, \
+                 patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
+                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render:
+                await main.render_song_episode(episode, scenes, {}, path)
+                self.assertEqual([call.args[0] for call in generate.await_args_list], [1, 2, 3])
+                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [
+                    path / "loop-1.mp4", path / "loop-2.mp4", path / "loop-1.mp4", path / "loop-3.mp4",
+                ])
 
     async def test_arabic_lyric_uses_basic_font_layout(self):
         used = []
@@ -497,7 +534,7 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
                  patch.object(main, "make_cloudflare_frame", new_callable=AsyncMock) as cloudflare:
                 await main.render_song_episode(episode, scenes, {}, path)
-                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [path / "loop.mp4"] * 3)
+                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [path / "loop.mp4"])
                 cloudflare.assert_not_awaited()
 
 

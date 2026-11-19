@@ -52,6 +52,7 @@ wood = material("wood", (0.43, 0.22, 0.09))
 pink = material("pink", (0.95, 0.30, 0.45))
 yellow = material("yellow", (1.0, 0.75, 0.12))
 blue = material("blue", (0.10, 0.55, 0.95))
+purple = material("purple", (0.51, 0.28, 0.75))
 cream = material("cream", (1.0, 0.91, 0.73))
 coral = material("coral", (0.90, 0.30, 0.24))
 darkblue = material("dark blue", (0.05, 0.15, 0.30))
@@ -112,19 +113,26 @@ ball("collar", (0, -0.13, 1.49), (0.25, 0.19, 0.10), cream, root)
 ball("shirt badge", (0, -0.284, 1.18), (0.12, 0.025, 0.12), yellow, root)
 ball("badge dot", (0, -0.307, 1.18), (0.045, 0.012, 0.045), cream, root)
 ball("neck", (0, 0, 1.53), (0.16, 0.14, 0.18), skin, root)
+head = bpy.data.objects.new("head movement", None)
+scene.collection.objects.link(head)
+head.parent = root
+head.location.z = 1.98
 ball("head", (0, 0, 1.98), (0.48, 0.36, 0.49), skin, root)
 ball("hair cap", (0, 0.04, 2.28), (0.49, 0.36, 0.24), hair, root)
 for x in (-0.23, -0.08, 0.08, 0.23):
     ball("hair fringe", (x, -0.27, 2.27), (0.13, 0.11, 0.13), hair, root)
 ball("nose", (0, -0.358, 1.94), (0.068, 0.075, 0.06), skin, root)
 smile(root)
+eyes = []
 for side in (-1, 1):
     ball("ear", (side * 0.47, 0, 1.96), (0.12, 0.10, 0.16), skin, root)
     ball("cheek", (side * 0.30, -0.292, 1.86), (0.10, 0.025, 0.055), lightpink, root)
-    ball("eye", (side * 0.17, -0.325, 2.06), (0.105, 0.065, 0.13), white, root)
-    ball("iris", (side * 0.17, -0.382, 2.05), (0.058, 0.03, 0.069), darkblue, root)
-    ball("pupil", (side * 0.17, -0.408, 2.05), (0.037, 0.02, 0.048), black, root)
-    ball("eye shine", (side * 0.17 - 0.018, -0.428, 2.075), (0.017, 0.01, 0.02), white, root)
+    eyes.append(ball("eye", (side * 0.17, -0.325, 2.06), (0.105, 0.065, 0.13), white, root))
+    eyes.append(ball("iris", (side * 0.17, -0.382, 2.05), (0.058, 0.03, 0.069), darkblue, root))
+    eyes.append(ball("pupil", (side * 0.17, -0.408, 2.05), (0.037, 0.02, 0.048), black, root))
+    eyes.append(ball("eye shine", (side * 0.17 - 0.018, -0.428, 2.075), (0.017, 0.01, 0.02), white, root))
+    brow = ball("eyebrow", (side * 0.17, -0.32, 2.23), (0.105, 0.025, 0.025), hair, root)
+    brow.rotation_euler[1] = side * 0.12
     leg = bpy.data.objects.new(f"hip-{side}", None)
     scene.collection.objects.link(leg)
     leg.parent = root
@@ -132,7 +140,7 @@ for side in (-1, 1):
     ball("leg", (0, 0, -0.22), (0.16, 0.18, 0.33), pants, leg)
     ball("shoe", (0, -0.10, -0.69), (0.19, 0.29, 0.14), coral, leg)
     ball("shoe sole", (0, -0.10, -0.78), (0.19, 0.29, 0.065), cream, leg)
-    for frame, angle in ((1, -0.09), (7, 0.10), (13, -0.09), (19, 0.10), (25, -0.09)):
+    for frame, angle in ((1, -0.12), (7, 0.14), (13, -0.12), (19, 0.14), (25, -0.12)):
         leg.rotation_euler[0] = angle * side
         leg.keyframe_insert(data_path="rotation_euler", frame=frame)
     pivot = bpy.data.objects.new(f"shoulder-{side}", None)
@@ -143,9 +151,31 @@ for side in (-1, 1):
     arm.location = (side * 0.12, 0, -0.23)
     hand = ball("hand", (0, 0, 0), (0.14, 0.14, 0.14), skin, pivot)
     hand.location = (side * 0.20, 0, -0.49)
-    for frame, angle in ((1, -0.35), (7, 0.65), (13, -0.35), (19, 0.65), (25, -0.35)):
+    poses = (
+        (-0.65, 0.30, -0.65, 0.30, -0.65),
+        ((-2.45 if side == 1 else -0.3), (-1.8 if side == 1 else 0.1),
+         (-2.45 if side == 1 else -0.3), (-1.8 if side == 1 else 0.1), (-2.45 if side == 1 else -0.3)),
+        (-0.4, 1.15, -0.4, 1.15, -0.4),
+        ((-1.15 if side == 1 else -0.25), (-1.35 if side == 1 else 0.1),
+         (-1.15 if side == 1 else -0.25), (-1.35 if side == 1 else 0.1), (-1.15 if side == 1 else -0.25)),
+    )
+    for frame, angle in zip((1, 7, 13, 19, 25), poses[variant]):
         pivot.rotation_euler[1] = angle * side
+        pivot.rotation_euler[0] = -0.65 if variant == 2 else 0
         pivot.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+for obj in list(root.children):
+    if obj.name.startswith(("head.", "head", "hair", "nose", "smile", "ear", "cheek", "eye", "iris", "pupil", "eyebrow")) and obj != head:
+        obj.parent = head
+        obj.location.z -= 1.98
+for obj in eyes:
+    original = obj.scale.z
+    for frame, factor in ((1, 1), (16, 1), (18, 0.08), (20, 1), (25, 1)):
+        obj.scale.z = original * factor
+        obj.keyframe_insert(data_path="scale", frame=frame)
+for frame, tilt in ((1, -0.07), (7, 0.09), (13, 0.07), (19, -0.09), (25, -0.07)):
+    head.rotation_euler[1] = tilt
+    head.keyframe_insert(data_path="rotation_euler", frame=frame)
 
 for frame, tilt, height in ((1, -0.07, 0), (7, 0.06, 0.10), (13, 0.07, 0),
                             (19, -0.06, 0.10), (25, -0.07, 0)):
@@ -176,7 +206,11 @@ if variant == 0:
         for n in range(4):
             cube("fence post", (x + n * 0.35, 1.4, 0.40), (0.12, 0.13, 0.8), cream, 0.04)
         cube("fence rail", (x + 0.52, 1.4, 0.42), (1.2, 0.1, 0.12), cream, 0.03)
-    ball("toy ball", (-1.25, -0.35, 0.19), (0.22, 0.22, 0.22), coral)
+    toy = ball("toy ball", (-1.25, -0.35, 0.22), (0.22, 0.22, 0.22), coral)
+    for frame, x, z in ((1, -1.25, 0.22), (7, -1.1, 0.43), (13, -0.95, 0.22),
+                        (19, -1.1, 0.43), (25, -1.25, 0.22)):
+        toy.location.x, toy.location.z = x, z
+        toy.keyframe_insert(data_path="location", frame=frame)
 elif variant == 1:
     cube("playhouse", (2.1, 2.0, 0.65), (1.2, 0.7, 1.3), cream)
     bpy.ops.mesh.primitive_cone_add(vertices=4, radius1=1, depth=0.65, location=(2.1, 2.0, 1.62), rotation=(0, 0, math.pi / 4))
@@ -186,18 +220,47 @@ elif variant == 1:
     roof.data.materials.append(coral)
     ball("door", (2.1, 1.62, 0.38), (0.24, 0.06, 0.38), blue)
     cube("window", (2.48, 1.61, 0.87), (0.30, 0.06, 0.30), blue, 0.03)
+elif variant == 2:
+    for radius, color in ((1.38, coral), (1.24, yellow), (1.10, leaf), (0.96, blue), (0.82, purple)):
+        curve = bpy.data.curves.new("rainbow", "CURVE")
+        curve.dimensions = "3D"
+        curve.bevel_depth = 0.09
+        curve.bevel_resolution = 4
+        spline = curve.splines.new("POLY")
+        spline.points.add(32)
+        for i, point in enumerate(spline.points):
+            angle = math.pi * i / 32
+            point.co = (1.5 + radius * math.cos(angle), 2.5, 0.3 + radius * math.sin(angle), 1)
+        arc = bpy.data.objects.new("rainbow arc", curve)
+        scene.collection.objects.link(arc)
+        arc.data.materials.append(color)
+    for x in (0.12, 2.88):
+        for dx in (-0.18, 0, 0.18):
+            ball("rainbow cloud", (x + dx, 2.4, 0.35), (0.26, 0.18, 0.19), white)
 else:
-    for x, z, color in ((-2.15, 2.25, pink), (-1.65, 2.70, yellow), (2.20, 2.35, blue)):
-        ball("balloon", (x, 1.0, z), (0.24, 0.18, 0.32), color)
-        cube("balloon string", (x, 1.0, z - 0.55), (0.018, 0.018, 0.52), white, 0.005)
-    ball("toy ball", (1.55, -0.25, 0.24), (0.25, 0.25, 0.25), yellow)
+    for x, z, color in ((1.4, 0.30, coral), (2.05, 0.30, blue), (1.72, 0.85, yellow)):
+        cube("color block", (x, 0.8, z), (0.55, 0.55, 0.55), color, 0.07)
+        ball("block dot", (x, 0.51, z), (0.12, 0.02, 0.12), cream)
+butterfly = bpy.data.objects.new("butterfly", None)
+scene.collection.objects.link(butterfly)
+ball("butterfly body", (0, 0, 0), (0.035, 0.04, 0.13), darkblue, butterfly)
+for side in (-1, 1):
+    wing = ball("butterfly wing", (side * 0.12, 0, 0.05), (0.13, 0.04, 0.17), pink, butterfly)
+    for frame, angle in ((1, -0.3), (4, 0.8), (7, -0.3), (10, 0.8), (13, -0.3),
+                         (16, 0.8), (19, -0.3), (22, 0.8), (25, -0.3)):
+        wing.rotation_euler[2] = angle * side
+        wing.keyframe_insert(data_path="rotation_euler", frame=frame)
+for frame, x, z in ((1, -1.6, 2.45), (7, -1.3, 2.65), (13, -1.05, 2.45),
+                    (19, -1.3, 2.25), (25, -1.6, 2.45)):
+    butterfly.location = (x, -0.3, z)
+    butterfly.keyframe_insert(data_path="location", frame=frame)
 bpy.ops.object.light_add(type="AREA", location=(0, -4, 6))
 bpy.context.object.data.energy = 800
 bpy.context.object.data.shape = "DISK"
 bpy.context.object.data.size = 5
-bpy.ops.object.camera_add(location=((0, 0.9, -0.8)[variant], -7, 1.45), rotation=(math.radians(90), 0, 0))
+bpy.ops.object.camera_add(location=((0, 0.9, 0.6, 0.65)[variant], -7, 1.45), rotation=(math.radians(90), 0, 0))
 camera = bpy.context.object
 camera.data.type = "ORTHO"
-camera.data.ortho_scale = (5.8, 5.4, 5.4)[variant]
+camera.data.ortho_scale = (5.8, 5.4, 5.8, 5.4)[variant]
 scene.camera = camera
 bpy.ops.render.render(animation=True)
