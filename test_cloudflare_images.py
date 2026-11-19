@@ -127,6 +127,32 @@ class StudioHelpersTest(unittest.TestCase):
             self.assertAlmostEqual(captions[-1][2], 10)
             self.assertTrue(all(path.exists() for path, _, _ in captions))
 
+    def test_caption_playlist_covers_different_line_heights(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            captions = main.make_caption_images(
+                "one two three four five extraordinary " * 4, "en", 12, folder, 0
+            )
+            sizes = set()
+            for path, _, _ in captions:
+                with Image.open(path) as image:
+                    sizes.add(image.size)
+            self.assertEqual(sizes, {(720, 390)})
+            playlist = folder / "captions.txt"
+            main.write_caption_playlist(captions, playlist)
+            lines = playlist.read_text().splitlines()
+            self.assertEqual(len(lines), 2 * len(captions) + 1)
+            self.assertEqual(lines[-1], f"file '{captions[-1][0].name}'")
+            durations = [float(line.split()[1]) for line in lines if line.startswith("duration ")]
+            self.assertAlmostEqual(sum(durations), 12, places=5)
+
+    def test_ffmpeg_signal_diagnostic_does_not_claim_cause(self):
+        result = SimpleNamespace(returncode=-9, stderr="some output")
+        message = main.ffmpeg_scene_error(result, 0, 5)
+        self.assertIn("signal 9", message)
+        self.assertIn("scene 1/5", message)
+        self.assertIn("check Railway logs and memory usage", message)
+
 
 class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):
     async def test_prepares_next_scene_while_rendering_in_order(self):
