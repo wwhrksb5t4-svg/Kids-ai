@@ -75,6 +75,8 @@ Do not send Google passwords, OAuth tokens, or provider keys to anyone. Revoke O
 
 Set `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=fal` and `FAL_KEY` (from fal.ai dashboard). Each scene image is animated into a 5-second clip (`FAL_VIDEO_MODEL`, default Kling 2.1 standard) that plays forward and backward under the narration. This adds fal.ai cost per scene (about 6 clips per episode); check their pricing. Failures fail the render visibly; completed clips are reused on retry.
 
+Free option: `VIDEO_PROVIDER=hf` animates scenes through a public Hugging Face Space (`HF_SPACE`, `HF_API_NAME`, optional `HF_TOKEN` for a better free quota). It is slow, queued and unreliable; any scene that fails falls back to the zoom animation. The default Space's API arguments are unverified and may change, so test with `/today`.
+
 ## Schedule and publishing
 
 Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set times appropriate for your audience. The scheduler generates a draft/video at those times, then sends it to Telegram. No video is automatically published without the explicit approval button.

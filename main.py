@@ -68,6 +68,9 @@ CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 VIDEO_PROVIDER = (os.getenv("VIDEO_PROVIDER") or "none").strip().lower()
 FAL_KEY = (os.getenv("FAL_KEY") or "").strip()
 FAL_VIDEO_MODEL = (os.getenv("FAL_VIDEO_MODEL") or "fal-ai/kling-video/v2.1/standard/image-to-video").strip().strip("/")
+HF_SPACE = (os.getenv("HF_SPACE") or "Lightricks/ltx-video-distilled").strip()
+HF_API_NAME = (os.getenv("HF_API_NAME") or "/image_to_video").strip()
+HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 RENDER_RETRY_AFTER = timedelta(minutes=10)
 TELEGRAM_VIDEO_LIMIT = 49_000_000
 TELEGRAM_VIDEO_TARGET = 42_000_000
@@ -321,8 +324,12 @@ def make_frame(scene, path, index, total, language):
 
 
 def check_image_provider():
-    if VIDEO_PROVIDER == "fal" and (IMAGE_PROVIDER != "cloudflare" or not FAL_KEY):
-        raise RuntimeError("VIDEO_PROVIDER=fal requires IMAGE_PROVIDER=cloudflare and FAL_KEY.")
+    if VIDEO_PROVIDER not in ("none", "fal", "hf"):
+        raise RuntimeError("VIDEO_PROVIDER must be none, fal or hf.")
+    if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
+    if VIDEO_PROVIDER == "fal" and not FAL_KEY:
+        raise RuntimeError("VIDEO_PROVIDER=fal requires FAL_KEY.")
     if IMAGE_PROVIDER not in ("cards", "cloudflare"):
         raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
     if IMAGE_PROVIDER == "cloudflare" and not (
@@ -434,8 +441,12 @@ async def make_fal_motion(scene, image_path, path):
         raise RuntimeError("Could not reach fal.ai; try again.") from exc
     except (KeyError, ValueError, TypeError) as exc:
         raise RuntimeError("fal.ai returned an unexpected response.") from exc
+    await finalize_motion(video.content, path)
+
+
+async def finalize_motion(raw_bytes, path):
     raw = path.with_suffix(".raw.mp4")
-    raw.write_bytes(video.content)
+    raw.write_bytes(raw_bytes)
     # Play forward then backward so a 5s clip can loop under longer narration without a visible jump.
     result = await asyncio.to_thread(
         subprocess.run,
@@ -447,6 +458,38 @@ async def make_fal_motion(scene, image_path, path):
     raw.unlink(missing_ok=True)
     if result.returncode:
         raise RuntimeError(f"Could not process fal.ai clip: {result.stderr[-300:]}")
+
+
+async def make_hf_motion(scene, image_path, path):
+    """Free image-to-video through a public Hugging Face Space (slow, queued, may fail)."""
+    from gradio_client import Client, handle_file
+
+    prompt = ("Smooth 3D animated children's cartoon, gentle character movement. " + str(scene.get("motion") or scene.get("visual_description") or ""))[:500]
+
+    def run():
+        client = Client(HF_SPACE, hf_token=HF_TOKEN or None)
+        return client.predict(
+            prompt=prompt, negative_prompt="worst quality, distorted, text, watermark",
+            input_image_filepath=handle_file(str(image_path)), input_video_filepath=None,
+            height_ui=704, width_ui=512, mode="image-to-video", duration_ui=2,
+            ui_frames_to_use=9, seed_ui=42, randomize_seed=True, ui_guidance_scale=1,
+            improve_texture_flag=True, api_name=HF_API_NAME,
+        )
+
+    result = await asyncio.wait_for(asyncio.to_thread(run), timeout=900)
+    found = None
+    stack = [result]
+    while stack and not found:
+        item = stack.pop(0)
+        if isinstance(item, (list, tuple)):
+            stack.extend(item)
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, str) and item.lower().endswith((".mp4", ".webm")) and os.path.isfile(item):
+            found = item
+    if not found:
+        raise RuntimeError("Hugging Face Space returned no video.")
+    await finalize_motion(Path(found).read_bytes(), path)
 
 
 def audio_duration(path) -> float:
@@ -584,6 +627,12 @@ async def prepare_scene(scene, index, total, language, voice, job_dir):
                 await make_cloudflare_frame(scene, frame)
             if VIDEO_PROVIDER == "fal" and not motion.exists():
                 await make_fal_motion(scene, frame, motion)
+            elif VIDEO_PROVIDER == "hf" and not motion.exists():
+                try:
+                    await make_hf_motion(scene, frame, motion)
+                except Exception as exc:
+                    # Free Spaces are unreliable: fall back to the zoom animation for this scene.
+                    print(f"HF motion failed for scene {index+1}, using zoom: {exc}", flush=True)
         else:
             await asyncio.to_thread(make_frame, scene, frame, index, total, language)
 
@@ -653,7 +702,7 @@ async def render_video(episode_id: str):
         clip = job_dir / f"clip-{index}.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        use_motion = VIDEO_PROVIDER == "fal"
+        use_motion = VIDEO_PROVIDER in ("fal", "hf") and (job_dir / f"motion-{index}.mp4").exists()
         if use_motion:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(job_dir / f"motion-{index}.mp4"), "-i", str(audio)]
         else:
