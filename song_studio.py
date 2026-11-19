@@ -30,11 +30,19 @@ SONG_TOPICS = (
     "clean up time", "learning shapes at the playground", "washing hands with bubbles", "a trip to the beach",
 )
 MUSIC_FALLBACK = "children's nursery rhyme, upbeat, bouncy, kids choir, glockenspiel, ukulele, 105 bpm, joyful, sing-along"
+BLENDER_ACTIONS = ("dance", "wave", "clap", "point")
 
 
 async def write_song(client, model, topic, language, avoid_titles=(), character_instruction=""):
     name = "Arabic" if language == "ar" else "English"
     avoid = f" Do not reuse these earlier titles or ideas: {'; '.join(avoid_titles)}." if avoid_titles else ""
+    blender_direction = (
+        " For each section also return blender_action, exactly one of dance, wave, clap, point. "
+        "The available visuals are limited to: dance in a garden with a ball; wave near a playhouse; "
+        "clap in front of a rainbow; point toward colorful blocks. Choose the most suitable action for each section, "
+        "and vary the actions. These are the only things the animation can show: do not claim it depicts other actions or objects."
+        if character_instruction else ""
+    )
     prompt = (
         f"Write an original sing-along children's song for ages 2-6 in {name}. Theme: {topic}.{avoid} "
         f"Follow the structure of top nursery-rhyme channels: one cute recurring main character. {character_instruction} "
@@ -50,6 +58,7 @@ async def write_song(client, model, topic, language, avoid_titles=(), character_
         "and sections: 8 objects each with type ('verse' or 'chorus'), lines (4 strings in the song language), "
         "visual_description (English, self-contained, names characters, place and action) and motion (one English sentence of character movement). "
         "Chorus sections must use identical lines but different visual_description."
+        f"{blender_direction}"
     )
     system = "You are a kids music writer. Write original age-appropriate songs. Return valid JSON only."
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
@@ -111,8 +120,18 @@ def normalize_sections(song, character_sheet):
             "visual_description": str(section["visual_description"]).strip(),
             "motion": str(section.get("motion", "")).strip(),
             "character_sheet": character_sheet,
+            "blender_action": str(section.get("blender_action", "")).strip().lower(),
         })
     return scenes
+
+
+def blender_action_indices(scenes):
+    return [
+        BLENDER_ACTIONS.index(scene["blender_action"])
+        if scene.get("blender_action") in BLENDER_ACTIONS
+        else index % len(BLENDER_ACTIONS)
+        for index, scene in enumerate(scenes)
+    ]
 
 
 def lyrics_text(scenes):

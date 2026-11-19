@@ -720,14 +720,14 @@ blender_lock = asyncio.Lock()
 
 
 async def blender_animation(variant=0):
-    output = DATA_DIR / f"blender-child-v3-{variant}.mp4"
+    output = DATA_DIR / f"blender-child-v4-{variant}.mp4"
     async with blender_lock:
         if output.is_file() and output.stat().st_size:
             return output
         with tempfile.TemporaryDirectory(prefix="blender-", dir=WORK_DIR) as directory:
             folder = Path(directory)
             commands = [
-                ["blender", "-b", "--threads", "2", "--python", str(ROOT / "blender_character.py"), "--", str(folder), str(variant)],
+                ["blender", "-b", "--threads", "2", "--python-exit-code", "1", "--python", str(ROOT / "blender_character.py"), "--", str(folder), str(variant)],
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", "12", "-i", str(folder / "frame-%04d.png"),
                  "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", str(folder / "animation.mp4")],
             ]
@@ -774,7 +774,13 @@ async def render_song_episode(episode, scenes, meta, job_dir):
     elif VIDEO_PROVIDER == "hf":
         motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "blender":
-        prebuilt_motion = [await blender_animation(index) for index in range(3)]
+        actions = song_studio.blender_action_indices(scenes)
+        loops = {}
+        selected = sorted(set(actions))
+        for position, index in enumerate(selected):
+            loops[index] = await blender_animation(index)
+            progress(8 + (position + 1) * 10 // len(selected))
+        prebuilt_motion = [loops[index] for index in actions]
     output = MEDIA_DIR / f"{episode_id}.mp4"
     await song_studio.render_song_video(scenes, timings, song_file, language, job_dir, output, image, motion, lambda size: font(size, basic=True), shape_text, progress, prebuilt_motion=prebuilt_motion)
     with db() as con:
@@ -900,8 +906,8 @@ async def create_daily_episode(language: str, run_date: date):
                 topic = song_studio.SONG_TOPICS[(run_date.toordinal() + (1 if language == "en" else 0)) % len(song_studio.SONG_TOPICS)] if not DAILY_TOPIC else DAILY_TOPIC
                 try:
                     character_instruction = (
-                        "The main character must be an original young child in a garden. "
-                        "The video shows that child dancing in a garden throughout; do not describe the main character as an animal."
+                        "The main character is an original young child in a garden, not an animal. "
+                        "Write lyrics suitable for the limited animations described below, without claiming that unavailable objects appear."
                         if VIDEO_PROVIDER == "blender" else ""
                     )
                     story = await asyncio.wait_for(
