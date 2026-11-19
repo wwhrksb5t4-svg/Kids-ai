@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+import uuid
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -349,6 +350,93 @@ class TelegramStatusTest(unittest.IsolatedAsyncioTestCase):
         finally:
             with main.db() as con:
                 con.execute("DELETE FROM daily_runs WHERE run_date=? AND language='ar'", (today,))
+
+
+class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
+    async def test_send_failure_does_not_offer_publish_without_video(self):
+        episode_id = str(uuid.uuid4())
+        now = main.utc_now().isoformat()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "original.mp4"
+            source.write_bytes(b"video")
+            with main.db() as con:
+                con.execute(
+                    "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,video_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (episode_id, "2024-01-04", "ar", "topic", "title", "", "", "[]",
+                     "pending_review", str(source), now, now),
+                )
+            bot = SimpleNamespace(send_message=AsyncMock(), send_video=AsyncMock(side_effect=RuntimeError("upload failed")))
+            try:
+                with patch.object(main, "telegram_app", SimpleNamespace(bot=bot)), \
+                     patch.object(main, "ADMIN_TELEGRAM_ID", "123"):
+                    await main.send_episode_for_review(episode_id)
+                self.assertIn(f"/review {episode_id}", bot.send_message.await_args.kwargs["text"])
+                self.assertNotIn("reply_markup", bot.send_message.await_args.kwargs)
+            finally:
+                with main.db() as con:
+                    con.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+
+    async def test_large_video_sends_compressed_copy_and_keeps_original(self):
+        episode_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "original.mp4"
+            source.write_bytes(b"original video")
+            now = main.utc_now().isoformat()
+            with main.db() as con:
+                con.execute(
+                    "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,video_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (episode_id, "2024-01-02", "ar", "topic", "title", "", "", "[]",
+                     "pending_review", str(source), now, now),
+                )
+            bot = SimpleNamespace(send_message=AsyncMock(), send_video=AsyncMock())
+            captured = []
+
+            async def send_video(**kwargs):
+                captured.append(kwargs["video"].read())
+
+            bot.send_video.side_effect = send_video
+
+            def compress(path, folder):
+                self.assertEqual(path, source)
+                result = folder / "review.mp4"
+                result.write_bytes(b"compressed")
+                return result
+
+            try:
+                with patch.object(main, "telegram_app", SimpleNamespace(bot=bot)), \
+                     patch.object(main, "ADMIN_TELEGRAM_ID", "123"), \
+                     patch.object(main, "TELEGRAM_VIDEO_LIMIT", 10), \
+                     patch.object(main, "compress_for_telegram", side_effect=compress):
+                    await main.send_episode_for_review(episode_id)
+                self.assertEqual(captured, [b"compressed"])
+                self.assertEqual(source.read_bytes(), b"original video")
+                self.assertEqual(bot.send_video.await_args.kwargs["write_timeout"], 180)
+            finally:
+                with main.db() as con:
+                    con.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
+
+    async def test_review_command_requires_admin_and_pending_episode(self):
+        episode_id = str(uuid.uuid4())
+        now = main.utc_now().isoformat()
+        with main.db() as con:
+            con.execute(
+                "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,video_path,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (episode_id, "2024-01-03", "en", "topic", "title", "", "", "[]",
+                 "pending_review", "/tmp/example.mp4", now, now),
+            )
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123), message=SimpleNamespace(reply_text=AsyncMock()))
+        context = SimpleNamespace(args=[episode_id])
+        try:
+            with patch.object(main, "ADMIN_TELEGRAM_ID", "123"), \
+                 patch.object(main, "send_episode_for_review", new_callable=AsyncMock) as send:
+                await main.tg_review(update, context)
+                send.assert_awaited_once_with(episode_id)
+                update.effective_user.id = 456
+                await main.tg_review(update, context)
+                send.assert_awaited_once()
+        finally:
+            with main.db() as con:
+                con.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import struct
 import subprocess
+import tempfile
 import uuid
 import wave
 from contextlib import asynccontextmanager
@@ -65,6 +66,8 @@ IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
 CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
 CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
 RENDER_RETRY_AFTER = timedelta(minutes=10)
+TELEGRAM_VIDEO_LIMIT = 49_000_000
+TELEGRAM_VIDEO_TARGET = 42_000_000
 
 YOUTUBE_SCOPES = ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly", "https://www.googleapis.com/auth/yt-analytics.readonly"]
 MODEL_PREFERENCES = ("gpt-5.6", "gpt-5.6-sol", "claude-sonnet-4-6", "gemini-3.8-flash", "deepseek-v4-flash", "qwen3.7-max", "kimi-k2.8")
@@ -697,6 +700,40 @@ async def create_daily_episode(language: str, run_date: date):
         raise
 
 
+def compress_for_telegram(source: Path, folder: Path) -> Path:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(source)],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        duration = float(probe.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Could not determine video duration for Telegram compression.") from exc
+    if probe.returncode or not math.isfinite(duration) or duration <= 0:
+        raise RuntimeError("Could not determine video duration for Telegram compression.")
+    bitrate = int(TELEGRAM_VIDEO_TARGET * 8 / duration - 96_000)
+    if bitrate < 100_000:
+        raise RuntimeError("Video is too long to compress for Telegram without excessive quality loss.")
+    output = folder / "review.mp4"
+    common = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+        "-map", "0:v:0", "-c:v", "libx264", "-preset", "veryfast", "-threads", "2",
+        "-pix_fmt", "yuv420p", "-b:v", str(bitrate), "-passlogfile", str(folder / "pass"),
+    ]
+    for pass_args in (
+        ["-pass", "1", "-an", "-f", "null", os.devnull],
+        ["-pass", "2", "-map", "0:a:0?", "-c:a", "aac", "-b:a", "96k",
+         "-movflags", "+faststart", str(output)],
+    ):
+        result = subprocess.run(common + pass_args, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            raise RuntimeError(f"Telegram video compression failed (exit {result.returncode}): {result.stderr[-500:]}")
+    if not output.is_file() or output.stat().st_size >= TELEGRAM_VIDEO_LIMIT:
+        raise RuntimeError("Compressed video still exceeds the Telegram upload limit.")
+    return output
+
+
 async def send_episode_for_review(episode_id: str):
     if not telegram_app or not ADMIN_TELEGRAM_ID:
         return
@@ -706,10 +743,32 @@ async def send_episode_for_review(episode_id: str):
         return
     caption = f"مسودة جديدة للمراجعة\n{row['title']}\nاللغة: {'العربية' if row['language']=='ar' else 'English'}\n\nلن تُنشر إلا بعد ضغط زر الموافقة."
     try:
-        with open(row["video_path"], "rb") as video:
-            await telegram_app.bot.send_video(chat_id=int(ADMIN_TELEGRAM_ID), video=video, caption=caption[:1000], supports_streaming=True, reply_markup=telegram_keyboard(episode_id))
+        source = Path(row["video_path"])
+        with tempfile.TemporaryDirectory(prefix="telegram-review-", dir=WORK_DIR) as directory:
+            video_path = source
+            if source.stat().st_size >= TELEGRAM_VIDEO_LIMIT:
+                await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text="الفيديو جاهز؛ جارٍ ضغط نسخة للمراجعة في Telegram.")
+                video_path = await asyncio.to_thread(compress_for_telegram, source, Path(directory))
+            with video_path.open("rb") as video:
+                await telegram_app.bot.send_video(chat_id=int(ADMIN_TELEGRAM_ID), video=video, caption=caption[:1000], supports_streaming=True, reply_markup=telegram_keyboard(episode_id), write_timeout=180)
     except Exception as exc:
-        await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=f"جهزت الحلقة لكن تعذر إرسال الفيديو إلى Telegram: {str(exc)[:500]}\nمعرّف الحلقة: {episode_id}", reply_markup=telegram_keyboard(episode_id))
+        await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=f"جهزت الحلقة لكن تعذر إرسال الفيديو إلى Telegram: {str(exc)[:500]}\nلإعادة المحاولة: /review {episode_id}")
+
+
+async def tg_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("استخدم /review متبوعاً بمعرّف الحلقة.")
+        return
+    episode_id = context.args[0]
+    with db() as con:
+        row = con.execute("SELECT status,video_path FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if not row or row["status"] not in ("pending_review", "ready_for_review") or not row["video_path"]:
+        await update.message.reply_text("لم أجد فيديو جاهزاً للمراجعة بهذا المعرّف.")
+        return
+    await send_episode_for_review(episode_id)
 
 
 async def publish_episode(episode_id: str):
@@ -906,6 +965,7 @@ def register_telegram_handlers(application):
     application.add_handler(CommandHandler("start", tg_start))
     application.add_handler(CommandHandler("connect", tg_connect))
     application.add_handler(CommandHandler("today", tg_today, block=False))
+    application.add_handler(CommandHandler("review", tg_review, block=False))
     application.add_handler(CommandHandler("status", tg_status))
     application.add_handler(CommandHandler("stats", tg_stats))
     application.add_handler(CallbackQueryHandler(tg_callback, pattern=r"^generate:today$", block=False))
