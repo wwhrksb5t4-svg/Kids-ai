@@ -257,10 +257,11 @@ async def render_song_video(scenes, timings, song, language, job_dir, output, ma
     for index, scene in enumerate(scenes):
         start, end, line_times = timings[index]
         duration = end - start
-        frame = job_dir / f"artwork-{index}.png"
+        key = "chorus" if scene["type"] == "chorus" else index  # repeated chorus reuses one image/clip: saves quota and mirrors real kids songs
+        frame = job_dir / f"artwork-{key}.png"
         if not frame.exists():
             await make_image(scene, frame)
-        motion = job_dir / f"motion-{index}.mp4"
+        motion = job_dir / f"motion-{key}.mp4"
         if make_motion and not motion.exists():
             try:
                 await make_motion(scene, frame, motion)

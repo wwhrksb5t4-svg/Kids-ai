@@ -376,12 +376,14 @@ def cloudflare_error(response):
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
-async def make_pollinations_frame(prompt, path, size):
-    """Free keyless fallback used when the Cloudflare daily quota is exhausted."""
-    url = "https://image.pollinations.ai/prompt/" + quote(prompt[:900])
+async def make_hf_inference_frame(prompt, path, size):
+    """Fallback when the Cloudflare daily quota is exhausted: Hugging Face Inference (needs HF_TOKEN; free credits are limited)."""
+    if not HF_TOKEN:
+        raise RuntimeError("Cloudflare image quota is exhausted. Wait for the daily reset (00:00 UTC) or set HF_TOKEN for a fallback.")
+    url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
     try:
-        async with httpx.AsyncClient(timeout=180, follow_redirects=True) as http:
-            response = await http.get(url, params={"width": size[0], "height": size[1], "model": "flux", "nologo": "true", "seed": secrets.randbelow(10**6)})
+        async with httpx.AsyncClient(timeout=180) as http:
+            response = await http.post(url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, json={"inputs": prompt[:900], "parameters": {"width": 1024, "height": 576 if size[0] > size[1] else 1024}})
         response.raise_for_status()
         with Image.open(io.BytesIO(response.content)) as image:
             image = ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS)
@@ -396,9 +398,9 @@ async def make_cloudflare_frame(scene, path, size=(720, 1280), style=""):
     except RuntimeError as exc:
         if "HTTP 429" not in str(exc) and "4006" not in str(exc):
             raise
-        print("Cloudflare quota exhausted; using Pollinations fallback.", flush=True)
+        print("Cloudflare quota exhausted; trying Hugging Face fallback.", flush=True)
         prompt = ((style or "children's storybook illustration") + " " + str(scene.get("character_sheet", ""))[:500] + " Scene: " + str(scene.get("visual_description", "")))
-        await make_pollinations_frame(prompt, path, size)
+        await make_hf_inference_frame(prompt, path, size)
 
 
 async def _cloudflare_frame(scene, path, size=(720, 1280), style=""):
