@@ -32,12 +32,13 @@ SONG_TOPICS = (
 MUSIC_FALLBACK = "children's nursery rhyme, upbeat, bouncy, kids choir, glockenspiel, ukulele, 105 bpm, joyful, sing-along"
 
 
-async def write_song(client, model, topic, language, avoid_titles=()):
+async def write_song(client, model, topic, language, avoid_titles=(), character_instruction=""):
     name = "Arabic" if language == "ar" else "English"
     avoid = f" Do not reuse these earlier titles or ideas: {'; '.join(avoid_titles)}." if avoid_titles else ""
     prompt = (
         f"Write an original sing-along children's song for ages 2-6 in {name}. Theme: {topic}.{avoid} "
-        "Follow the structure of top nursery-rhyme channels: one cute recurring main character, very simple AABB rhymes, "
+        f"Follow the structure of top nursery-rhyme channels: one cute recurring main character. {character_instruction} "
+        "Use very simple AABB rhymes, "
         "4-7 words per line, a catchy chorus of 4 short lines that repeats 3 times word-for-word, and fun action words kids can copy. "
         "Total song: intro-free, 8 sections in this order: verse, chorus, verse, chorus, verse, chorus, verse, chorus "
         "(each verse and chorus has 4 lines), about 110-170 words in total so it sings in roughly 90-120 seconds. "
@@ -263,7 +264,7 @@ async def render_song_video(scenes, timings, song, language, job_dir, output, ma
             await make_image(scene, frame)
         motion = job_dir / f"motion-{key}.mp4"
         if prebuilt_motion is not None:
-            motion = prebuilt_motion
+            motion = prebuilt_motion[index % len(prebuilt_motion)]
         elif make_motion and not motion.exists():
             try:
                 await make_motion(scene, frame, motion)
