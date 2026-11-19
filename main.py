@@ -720,7 +720,7 @@ blender_lock = asyncio.Lock()
 
 
 async def blender_animation(variant=0):
-    output = DATA_DIR / f"blender-child-v2-{variant}.mp4"
+    output = DATA_DIR / f"blender-child-v3-{variant}.mp4"
     async with blender_lock:
         if output.is_file() and output.stat().st_size:
             return output
