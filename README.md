@@ -7,7 +7,8 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 - Creates one Arabic and one English original episode per day at configured UTC times (defaults 12:00 and 14:00). Each script targets 300-360 spoken words; actual duration depends on narration speed. If the story is outside that range, the model is asked to revise it, up to three attempts.
 - Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model.
 - Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
-- The button shown by `/start`, or `/today`, manually generates both language versions; `/status` lists recent episodes; `/stats` queries YouTube Analytics.
+- `/new` or the `/start` button accepts a user idea and offers story, educational, and adventure scripts; short or 2-3 minute duration; Arabic or English; and the configured primary or alternate voice. The bot sends a script and scene-outline preview first. Only after approving production does it render and send the video for a separate YouTube publish approval.
+- `/today` manually generates scheduled episodes; `/status` lists recent episodes; `/resume EPISODE_ID` retries a failed or stale idea-video render using saved scripts and reusable scene files; `/cancel` cancels an unfinished `/new` setup; `/stats` queries YouTube Analytics.
 - Telegram review uploads larger than 49 MB are compressed into a temporary copy; the original video is retained for YouTube. Use `/review EPISODE_ID` to retry sending an existing video awaiting review.
 - `/status` includes today's generation state (even before a script is saved), render progress and the latest error. `/today` runs without blocking other Telegram commands, and retries failed renders and episodes stuck in `rendering` for over 10 minutes, reusing the saved script.
 - Scene artwork and narration are prepared concurrently, with one scene prepared ahead while FFmpeg renders the current scene. Rendering stays sequential to limit CPU use.
@@ -16,7 +17,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 
 ## Important limitations
 
-By default the renderer uses text cards. Cloudflare mode generates still images with a slow zoom, **not fully animated characters or songs**. Images can be inconsistent or unsuitable, so review every video before approval. Edge TTS is used for voice. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today` after reviewing the error.
+By default the renderer uses text cards. Cloudflare mode generates still images with a slow zoom, **not fully animated characters or songs**. Image-to-video providers require their own configuration and may fail, queue, or incur cost; the experimental Blender renderer only supports preset song loops, not arbitrary story scenes. The `/new` flow uses the currently deployed image/video provider settings; it does not switch providers or styles per episode. Edge TTS is used for voice. The short and long duration options target narration word counts, not guaranteed final runtime. The current story renderer exports vertical 720p video; it does not upscale source art to 1080p. Generated sound-effect descriptions are not yet mixed as actual per-scene sound effects. Review every video before approval. Daily generation can incur provider costs and may be affected by Railway uptime, API limits, and outbound network access. The scheduler runs inside the web service; use one Railway replica and keep it running. Failed daily runs can be retried with `/today`.
 
 YouTube OAuth needs Google Cloud setup and may require OAuth consent-screen configuration/testing. The Google account must own or manage the target channel. Analytics data availability can lag. Before publishing, the admin must review every video; children's content requires careful manual checks. This software does not guarantee YouTube policy compliance or channel growth.
 
@@ -61,6 +62,7 @@ Add a Railway Volume mounted at `/app/data` so the SQLite database, media, and G
 1. Create a bot with Telegram `@BotFather`; set its token as `TELEGRAM_BOT_TOKEN`.
 2. Obtain your numeric Telegram user ID and set `ADMIN_TELEGRAM_ID` to it. Only this ID can control the bot.
 3. Set Railway variables and redeploy. Open your bot, send `/start`.
+4. Send `/new`, enter an idea, choose the script type, length, language, and configured voice. Review the script and scene outline. Approve production only when ready; after the rendered video arrives, use its separate button to approve YouTube publishing.
 
 ### Google / YouTube OAuth
 

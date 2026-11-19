@@ -3,6 +3,7 @@ import asyncio
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 import uuid
@@ -188,6 +189,135 @@ class StoryLengthTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, "client", client):
             with self.assertRaisesRegex(RuntimeError, r"actual counts: 60, 120, 180"):
                 await main.write_story("friendship", "ar", "model")
+
+    async def test_short_educational_story_uses_requested_length_and_scene_count(self):
+        create = AsyncMock(return_value=self.response(40, 3))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with patch.object(main, "client", client):
+            story = await main.write_story(
+                "counting with a friendly fox", "ar", "model",
+                min_words=100, max_words=140, scene_count=3, max_scenes=3,
+                content_type="educational",
+            )
+        self.assertEqual(len(story["scenes"]), 3)
+        prompt = create.await_args.kwargs["messages"][1]["content"]
+        self.assertIn("100-140 words", prompt)
+        self.assertIn("about 45-60 seconds", prompt)
+        self.assertIn("exactly 3 objects", prompt)
+        self.assertIn("Teach one age-appropriate fact", prompt)
+
+
+class IdeaEpisodeStorageTest(unittest.TestCase):
+    def test_existing_database_migrates_without_losing_daily_episode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            with sqlite3.connect(path) as con:
+                con.execute("""CREATE TABLE episodes (
+                    id TEXT PRIMARY KEY, episode_date TEXT NOT NULL, language TEXT NOT NULL,
+                    topic TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
+                    script TEXT NOT NULL, scenes TEXT NOT NULL, status TEXT NOT NULL,
+                    video_path TEXT, youtube_video_id TEXT, youtube_url TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, model TEXT,
+                    render_progress INTEGER NOT NULL DEFAULT 0, render_error TEXT,
+                    analytics TEXT, meta TEXT, UNIQUE(episode_date, language)
+                )""")
+                con.execute(
+                    "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    ("existing", "2026-11-19", "ar", "topic", "title", "", "", "[]", "pending_review", "now", "now"),
+                )
+            with patch.object(main, "DB_PATH", path):
+                main.init_db()
+                with main.db() as con:
+                    old = con.execute("SELECT id,source FROM episodes WHERE id='existing'").fetchone()
+                    con.execute(
+                        "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("idea", "2026-11-19", "ar", "idea", "idea", "", "", "[]", "draft", "now", "now", "idea"),
+                    )
+                    self.assertEqual(tuple(old), ("existing", "daily"))
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        con.execute(
+                            "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            ("duplicate", "2026-11-19", "ar", "topic", "title", "", "", "[]", "draft", "now", "now"),
+                        )
+
+
+class IdeaDraftTest(unittest.IsolatedAsyncioTestCase):
+    async def test_telegram_setup_collects_choices_before_preview(self):
+        message = SimpleNamespace(text="تعلم الألوان مع طفلة وقطتها", reply_text=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=123), message=message)
+        context = SimpleNamespace(user_data={}, args=[])
+        query = SimpleNamespace(message=message, answer=AsyncMock())
+        story, scenes = {"title": "ألواننا"}, [{"narration": "مرحبا", "visual_description": "حديقة"}]
+        with patch.object(main, "ADMIN_TELEGRAM_ID", "123"), \
+             patch.object(main, "create_idea_draft", new_callable=AsyncMock, return_value=("draft-id", story, scenes)) as create, \
+             patch.object(main, "send_idea_preview", new_callable=AsyncMock) as preview:
+            await main.tg_new(update, context)
+            await main.tg_idea_text(update, context)
+            for selection in ("idea:type:educational", "idea:duration:short", "idea:language:ar", "idea:voice:alternate"):
+                query.data = selection
+                update.callback_query = query
+                await main.tg_callback(update, context)
+            self.assertEqual(create.await_args.args[0]["idea"], message.text)
+            self.assertEqual(create.await_args.args[0]["duration"], "short")
+            self.assertEqual(create.await_args.args[0]["voice"], main.VOICE_SONG_AR)
+            preview.assert_awaited_once_with(message, "draft-id", story, scenes)
+            self.assertNotIn("idea_flow", context.user_data)
+
+    async def test_preview_is_saved_separately_with_selected_voice(self):
+        story = {
+            "title": "Counting with a fox",
+            "description": "A gentle lesson.",
+            "art_style": "Colorful original 3D cartoon.",
+            "characters": [{"name": "Fifi", "appearance": "A small orange fox in a blue scarf."}],
+            "scenes": [
+                {"narration": " ".join(["word"] * 40), "visual_description": f"Fifi counts blocks in scene {i}.", "motion": "Fifi points."}
+                for i in range(3)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ideas.sqlite3"
+            with patch.object(main, "DB_PATH", path):
+                main.init_db()
+                with patch.object(main, "select_model", new_callable=AsyncMock, return_value="test-model"), \
+                     patch.object(main, "write_story", new_callable=AsyncMock, return_value=story) as write:
+                    episode_id, _, scenes = await main.create_idea_draft({
+                        "idea": "counting with a fox", "type": "educational", "duration": "short",
+                        "language": "ar", "voice": "ar-SA-ZariyahNeural",
+                    })
+                with main.db() as con:
+                    row = con.execute("SELECT status,source,meta,scenes FROM episodes WHERE id=?", (episode_id,)).fetchone()
+                self.assertEqual((row["status"], row["source"]), ("draft", "idea"))
+                self.assertEqual(json.loads(row["meta"])["voice"], "ar-SA-ZariyahNeural")
+                self.assertEqual(len(json.loads(row["scenes"])), 3)
+                self.assertEqual(len(scenes), 3)
+                self.assertEqual(write.await_args.kwargs["min_words"], 100)
+
+    async def test_production_approval_renders_once_and_leaves_youtube_approval_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approval.sqlite3"
+            with patch.object(main, "DB_PATH", path):
+                main.init_db()
+                with main.db() as con:
+                    con.execute(
+                        "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("idea-id", "2026-11-19", "ar", "idea", "title", "", "", "[]", "draft", "now", "now", "idea"),
+                    )
+
+                async def render(episode_id):
+                    with main.db() as con:
+                        con.execute("UPDATE episodes SET status='ready_for_review' WHERE id=?", (episode_id,))
+
+                report = AsyncMock()
+                with patch.object(main, "VIDEO_PROVIDER", "none"), \
+                     patch.object(main, "render_video", side_effect=render) as render_video, \
+                     patch.object(main, "send_episode_for_review", new_callable=AsyncMock) as send:
+                    await main.produce_idea_episode("idea-id", report)
+                    await main.produce_idea_episode("idea-id", report)
+                self.assertEqual(render_video.await_count, 1)
+                send.assert_awaited_once_with("idea-id")
+                with main.db() as con:
+                    self.assertEqual(con.execute("SELECT status FROM episodes WHERE id='idea-id'").fetchone()["status"], "ready_for_review")
+                self.assertTrue(any("YouTube" in call.args[0] for call in report.await_args_list))
 
 
 class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):

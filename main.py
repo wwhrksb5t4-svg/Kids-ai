@@ -34,7 +34,7 @@ from googleapiclient.http import MediaFileUpload
 from openai import AsyncOpenAI
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data"))).resolve()
@@ -110,10 +110,31 @@ def init_db():
             video_path TEXT, youtube_video_id TEXT, youtube_url TEXT,
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, model TEXT,
             render_progress INTEGER NOT NULL DEFAULT 0, render_error TEXT,
-            analytics TEXT, UNIQUE(episode_date, language)
+            analytics TEXT, meta TEXT, source TEXT NOT NULL DEFAULT 'daily'
         )""")
         if "meta" not in [r[1] for r in con.execute("PRAGMA table_info(episodes)")]:
             con.execute("ALTER TABLE episodes ADD COLUMN meta TEXT")
+        columns = [row[1] for row in con.execute("PRAGMA table_info(episodes)")]
+        table_sql = con.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='episodes'").fetchone()[0]
+        if "UNIQUE(episode_date,language)" in table_sql.replace(" ", ""):
+            con.execute("""CREATE TABLE episodes_migrating (
+                id TEXT PRIMARY KEY, episode_date TEXT NOT NULL, language TEXT NOT NULL,
+                topic TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
+                script TEXT NOT NULL, scenes TEXT NOT NULL, status TEXT NOT NULL,
+                video_path TEXT, youtube_video_id TEXT, youtube_url TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, model TEXT,
+                render_progress INTEGER NOT NULL DEFAULT 0, render_error TEXT,
+                analytics TEXT, meta TEXT, source TEXT NOT NULL DEFAULT 'daily'
+            )""")
+            source = "source" if "source" in columns else "'daily'"
+            con.execute(
+                f"INSERT INTO episodes_migrating SELECT id,episode_date,language,topic,title,description,script,scenes,status,video_path,youtube_video_id,youtube_url,created_at,updated_at,model,render_progress,render_error,analytics,meta,{source} FROM episodes"
+            )
+            con.execute("DROP TABLE episodes")
+            con.execute("ALTER TABLE episodes_migrating RENAME TO episodes")
+        elif "source" not in columns:
+            con.execute("ALTER TABLE episodes ADD COLUMN source TEXT NOT NULL DEFAULT 'daily'")
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_episode_date_language ON episodes(episode_date,language) WHERE source='daily'")
         con.execute("""CREATE TABLE IF NOT EXISTS oauth_states (
             state TEXT PRIMARY KEY, created_at TEXT NOT NULL, code_verifier TEXT
         )""")
@@ -223,21 +244,32 @@ def recent_titles(limit=15):
         return [r["title"] for r in con.execute("SELECT title FROM episodes ORDER BY created_at DESC LIMIT ?", (limit,))]
 
 
-async def write_story(topic: str, language: str, model: str, avoid_titles=()):
+async def write_story(
+    topic: str, language: str, model: str, avoid_titles=(),
+    min_words=300, max_words=360, scene_count=6, max_scenes=8,
+    content_type="story",
+):
     language_name = "Arabic" if language == "ar" else "English"
-    min_words, max_words = 300, 360
+    type_guidance = {
+        "story": "Tell an imaginative story with a clear beginning, middle, happy ending, and positive lesson.",
+        "educational": "Teach one age-appropriate fact or skill through a story, and make the lesson clear without lecturing.",
+        "adventure": "Tell a gentle, exciting adventure with a child-safe challenge and a happy resolution.",
+    }.get(content_type, "Tell an imaginative story with a clear beginning, middle, happy ending, and positive lesson.")
+    if not 1 <= scene_count <= 8 or not 1 <= min_words <= max_words:
+        raise ValueError("Story length or scene count is outside supported limits.")
+    duration_text = "about 45-60 seconds" if max_words <= 160 else "about 2-3 minutes"
     avoid = f" Do not reuse the plots or titles of these earlier episodes: {'; '.join(avoid_titles)}." if avoid_titles else ""
     prompt = (
         f"Write an original gentle cartoon episode for children ages 4-8 in {language_name}. Theme: {topic}.{avoid} "
-        f"The combined spoken narration must contain {min_words}-{max_words} words so the finished narrated video lasts about 2-3 minutes. "
+        f"The combined spoken narration must contain {min_words}-{max_words} words so the finished narrated video lasts {duration_text}. "
         "Use original characters and never copy copyrighted franchises. No frightening scenes, violence, or unsafe instructions. "
         "Keep character names and events aligned between language versions. "
         "Return JSON with: title, description, moral, art_style (one English sentence describing a single consistent visual style), "
         "characters (1-3 objects with name and appearance; appearance is a detailed English description of face, colors and clothing), "
-        "and scenes: exactly 6 objects, each having visual_description, motion (one English sentence describing the characters' movement), narration, sound_effect. "
-        "Write approximately 55 spoken words in each scene's narration; do not count other fields. "
+        f"and scenes: exactly {scene_count} objects, each having visual_description, motion (one English sentence describing the characters' movement), narration, sound_effect. "
+        f"Write approximately {max(1, (min_words + max_words) // (2 * scene_count))} spoken words in each scene's narration; do not count other fields. "
         "Write each visual_description in English as a self-contained illustration prompt that names the characters present, the place and the action. "
-        f"Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
+        f"Narration must be in {language_name}. {type_guidance}"
     )
     system = "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
@@ -255,7 +287,7 @@ async def write_story(topic: str, language: str, model: str, avoid_titles=()):
         usable_scenes = [
             scene for scene in scenes
             if isinstance(scene, dict) and str(scene.get("narration", "")).strip()
-        ][:8] if isinstance(scenes, list) else []
+        ][:max_scenes] if isinstance(scenes, list) else []
         narration = " ".join(str(scene.get("narration", "")) for scene in usable_scenes)
         word_count = len(re.findall(r"\S+", narration))
         counts.append(word_count)
@@ -268,7 +300,8 @@ async def write_story(topic: str, language: str, model: str, avoid_titles=()):
             {"role": "assistant", "content": content},
             {"role": "user", "content": (
                 f"The usable scene narration contained {word_count} words. {adjustment} the narration "
-                f"to {min_words}-{max_words} words total, aiming for about 55 words in each of 6 scenes. "
+                f"to {min_words}-{max_words} words total, aiming for about "
+                f"{max(1, (min_words + max_words) // (2 * scene_count))} words in each of {scene_count} scenes. "
                 "Keep the same characters and story, and return the complete corrected JSON."
             )},
         ]
@@ -794,17 +827,18 @@ async def render_video(episode_id: str):
     if not row:
         raise RuntimeError("Episode not found")
     episode = dict(row)
+    episode_meta = json.loads(episode["meta"]) if episode.get("meta") else {}
     scenes = json.loads(episode["scenes"])
     check_image_provider()
     if not subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0:
         raise RuntimeError("FFmpeg is missing")
     job_dir = WORK_DIR / episode_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    if episode.get("meta") and json.loads(episode["meta"]).get("kind") == "song":
-        return await render_song_episode(episode, scenes, json.loads(episode["meta"]), job_dir)
+    if episode_meta.get("kind") == "song":
+        return await render_song_episode(episode, scenes, episode_meta, job_dir)
     if VIDEO_PROVIDER == "blender":
         raise RuntimeError("VIDEO_PROVIDER=blender currently supports song episodes only; use CONTENT_MODE=song.")
-    voice = VOICE_AR if episode["language"] == "ar" else VOICE_EN
+    voice = episode_meta.get("voice") or (VOICE_AR if episode["language"] == "ar" else VOICE_EN)
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
         music = None
@@ -877,7 +911,10 @@ async def create_daily_episode(language: str, run_date: date):
     run_key = run_date.isoformat()
     episode_id = None
     with db() as con:
-        existing = con.execute("SELECT * FROM episodes WHERE episode_date=? AND language=?", (run_key, language)).fetchone()
+        existing = con.execute(
+            "SELECT * FROM episodes WHERE episode_date=? AND language=? AND source='daily'",
+            (run_key, language),
+        ).fetchone()
         if existing:
             episode = dict(existing)
             updated_at = datetime.fromisoformat(episode["updated_at"])
@@ -987,11 +1024,11 @@ def compress_for_telegram(source: Path, folder: Path) -> Path:
 
 async def send_episode_for_review(episode_id: str):
     if not telegram_app or not ADMIN_TELEGRAM_ID:
-        return
+        return False
     with db() as con:
         row = con.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
     if not row or not row["video_path"]:
-        return
+        return False
     caption = f"مسودة جديدة للمراجعة\n{row['title']}\nاللغة: {'العربية' if row['language']=='ar' else 'English'}\n\nلن تُنشر إلا بعد ضغط زر الموافقة."
     try:
         source = Path(row["video_path"])
@@ -1002,8 +1039,10 @@ async def send_episode_for_review(episode_id: str):
                 video_path = await asyncio.to_thread(compress_for_telegram, source, Path(directory))
             with video_path.open("rb") as video:
                 await telegram_app.bot.send_video(chat_id=int(ADMIN_TELEGRAM_ID), video=video, caption=caption[:1000], supports_streaming=True, reply_markup=telegram_keyboard(episode_id), write_timeout=180)
+        return True
     except Exception as exc:
         await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=f"جهزت الحلقة لكن تعذر إرسال الفيديو إلى Telegram: {str(exc)[:500]}\nلإعادة المحاولة: /review {episode_id}")
+        return False
 
 
 async def tg_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1020,6 +1059,16 @@ async def tg_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لم أجد فيديو جاهزاً للمراجعة بهذا المعرّف.")
         return
     await send_episode_for_review(episode_id)
+
+
+async def tg_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("استخدم /resume متبوعاً بمعرّف المسودة الفاشلة.")
+        return
+    await produce_idea_episode(context.args[0], update.message.reply_text)
 
 
 async def publish_episode(episode_id: str):
@@ -1049,9 +1098,180 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
     await update.message.reply_text(
-        "أهلًا بك في Kids Haven Studio.\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nكل فيديو يحتاج موافقتك قبل النشر العام.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")]]),
+        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو من فكرتك\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nكل فيديو يحتاج موافقتك قبل النشر العام.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✨ إنشاء فيديو من فكرة", callback_data="idea:new")],
+            [InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")],
+        ]),
     )
+
+
+async def tg_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    context.user_data["idea_flow"] = {"step": "idea"}
+    await update.message.reply_text(
+        "أرسل فكرة الفيديو بجملة أو جملتين. بعدها تختار النوع والمدة واللغة والصوت، "
+        "وتراجع السيناريو قبل بدء الإنتاج.\n/cancel لإلغاء."
+    )
+
+
+async def tg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update):
+        await update.message.reply_text("غير مصرح.")
+        return
+    context.user_data.pop("idea_flow", None)
+    await update.message.reply_text("تم إلغاء إعداد الفكرة.")
+
+
+async def tg_idea_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not admin_only(update) or not update.message:
+        return
+    flow = context.user_data.get("idea_flow")
+    if not flow or flow.get("step") != "idea":
+        return
+    idea = (update.message.text or "").strip()
+    if not 3 <= len(idea) <= 500:
+        await update.message.reply_text("اكتب الفكرة بين 3 و500 حرف.")
+        return
+    flow.update(idea=idea, step="type")
+    await update.message.reply_text(
+        "اختر نوع الفيديو:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("قصة", callback_data="idea:type:story"),
+            InlineKeyboardButton("تعليمي", callback_data="idea:type:educational"),
+            InlineKeyboardButton("مغامرة", callback_data="idea:type:adventure"),
+        ]]),
+    )
+
+
+def idea_selection_keyboard(step):
+    choices = {
+        "duration": [("قصير (نحو دقيقة)", "short"), ("قصة (نحو 2-3 دقائق)", "long")],
+        "language": [("العربية", "ar"), ("English", "en")],
+        "voice": [("الصوت الأساسي", "primary"), ("صوت بديل", "alternate")],
+    }
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"idea:{step}:{value}")
+        for label, value in choices[step]
+    ]])
+
+
+async def create_idea_draft(flow):
+    language = flow["language"]
+    min_words, max_words, scene_count = (100, 140, 3) if flow["duration"] == "short" else (300, 360, 6)
+    model = await asyncio.wait_for(select_model(), timeout=90)
+    story = await asyncio.wait_for(
+        write_story(
+            flow["idea"], language, model, recent_titles(),
+            min_words=min_words, max_words=max_words, scene_count=scene_count,
+            max_scenes=scene_count, content_type=flow["type"],
+        ),
+        timeout=300,
+    )
+    sheet = character_sheet(story)
+    raw_scenes = story.get("scenes")
+    if not isinstance(raw_scenes, list):
+        raise RuntimeError("النموذج لم يُرجع مشاهد للسيناريو.")
+    scenes = [{
+        "visual_description": str(scene.get("visual_description", "")).strip(),
+        "narration": str(scene.get("narration", "")).strip(),
+        "sound_effect": str(scene.get("sound_effect", "gentle ambience")).strip(),
+        "motion": str(scene.get("motion", "")).strip(),
+        "character_sheet": sheet,
+    } for scene in raw_scenes[:scene_count]
+        if isinstance(scene, dict)
+        and str(scene.get("narration", "")).strip()
+        and str(scene.get("visual_description", "")).strip()]
+    if len(scenes) != scene_count:
+        raise RuntimeError(f"السيناريو يحتاج {scene_count} مشاهد صالحة؛ وصل {len(scenes)} فقط.")
+    episode_id = str(uuid.uuid4())
+    timestamp = utc_now().isoformat()
+    meta = json.dumps({
+        "kind": "story", "source": "idea", "idea": flow["idea"],
+        "content_type": flow["type"], "duration": flow["duration"], "voice": flow["voice"],
+    }, ensure_ascii=False)
+    with db() as con:
+        con.execute(
+            "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,model,meta,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                episode_id, utc_now().date().isoformat(), language, flow["idea"],
+                str(story.get("title") or flow["idea"])[:180],
+                str(story.get("description") or "")[:3000],
+                "\n\n".join(scene["narration"] for scene in scenes),
+                json.dumps(scenes, ensure_ascii=False), "draft", timestamp, timestamp,
+                model, meta, "idea",
+            ),
+        )
+    return episode_id, story, scenes
+
+
+async def send_idea_preview(message, episode_id, story, scenes):
+    title = str(story.get("title") or "مسودة سيناريو").strip()
+    text = f"معاينة السيناريو: {title}\n\n" + "\n\n".join(scene["narration"] for scene in scenes)
+    await message.reply_text(text[:3900])
+    outline = "\n".join(
+        f"{index}. {scene['visual_description'][:240]}"
+        for index, scene in enumerate(scenes, 1)
+    )
+    if outline:
+        await message.reply_text(("وصف المشاهد:\n" + outline)[:3900])
+    await message.reply_text(
+        "راجع السيناريو. لن يبدأ الإنتاج إلا بعد موافقتك:",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ ابدأ الإنتاج", callback_data=f"idea:produce:{episode_id}"),
+            InlineKeyboardButton("🗑 احذف المسودة", callback_data=f"idea:discard:{episode_id}"),
+        ]]),
+    )
+
+
+async def tg_idea_selection(query, context, parts):
+    flow = context.user_data.get("idea_flow")
+    if not flow or len(parts) != 3:
+        await query.message.reply_text("انتهت جلسة إعداد الفكرة. أرسل /new للبدء من جديد.")
+        return
+    step, value = parts[1], parts[2]
+    choices = {
+        "type": {"story", "educational", "adventure"},
+        "duration": {"short", "long"},
+        "language": {"ar", "en"},
+        "voice": {"primary", "alternate"},
+    }
+    if step not in choices or value not in choices[step] or flow.get("step") != step:
+        await query.message.reply_text("هذا الخيار غير صالح أو انتهت صلاحيته. أرسل /new للبدء من جديد.")
+        return
+    flow[step] = value
+    if step == "type":
+        flow["step"] = "duration"
+        await query.message.reply_text("اختر مدة تقريبية:", reply_markup=idea_selection_keyboard("duration"))
+        return
+    if step == "duration":
+        flow["step"] = "language"
+        await query.message.reply_text("اختر لغة السيناريو والتعليق:", reply_markup=idea_selection_keyboard("language"))
+        return
+    if step == "language":
+        flow["step"] = "voice"
+        await query.message.reply_text("اختر الصوت:", reply_markup=idea_selection_keyboard("voice"))
+        return
+    if generation_lock.locked():
+        await query.message.reply_text("فيه إنتاج آخر شغال. أرسل /new بعد انتهائه.")
+        context.user_data.pop("idea_flow", None)
+        return
+    flow["voice"] = {
+        ("ar", "primary"): VOICE_AR,
+        ("ar", "alternate"): VOICE_SONG_AR,
+        ("en", "primary"): VOICE_EN,
+        ("en", "alternate"): VOICE_SONG_EN,
+    }[(flow["language"], value)]
+    context.user_data.pop("idea_flow", None)
+    await query.message.reply_text("عم أكتب السيناريو الآن. ما رح يبدأ إنتاج الفيديو قبل ما تراجعه وتوافق.")
+    try:
+        async with generation_lock:
+            episode_id, story, scenes = await create_idea_draft(flow)
+        await send_idea_preview(query.message, episode_id, story, scenes)
+    except Exception as exc:
+        await query.message.reply_text(f"تعذر إنشاء معاينة السيناريو: {str(exc)[:700]}")
 
 
 async def tg_connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1078,6 +1298,50 @@ async def tg_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 generation_lock = asyncio.Lock()
+
+
+async def produce_idea_episode(episode_id, report):
+    if generation_lock.locked():
+        await report("فيه إنتاج آخر شغال الآن. جرّب الموافقة بعد انتهائه.")
+        return
+    with db() as con:
+        row = con.execute("SELECT status,source,updated_at FROM episodes WHERE id=?", (episode_id,)).fetchone()
+    if not row or row["source"] != "idea":
+        await report("هذه المسودة غير موجودة أو سبق بدء إنتاجها.")
+        return
+    retrying_stale = (
+        row["status"] == "rendering"
+        and row["updated_at"] < (utc_now() - RENDER_RETRY_AFTER).isoformat()
+    )
+    if row["status"] not in ("draft", "failed") and not retrying_stale:
+        await report("هذه المسودة غير موجودة أو سبق بدء إنتاجها.")
+        return
+    if VIDEO_PROVIDER == "blender":
+        await report("وضع Blender الحالي يدعم حلقات الأغاني الجاهزة فقط، وليس تمثيل القصص. غيّر VIDEO_PROVIDER إلى none أو fal أو hf قبل بدء إنتاج هذه المسودة.")
+        return
+    async with generation_lock:
+        with db() as con:
+            changed = con.execute(
+                "UPDATE episodes SET status='rendering',render_progress=0,render_error=NULL,updated_at=? WHERE id=? AND source='idea' AND (status IN ('draft','failed') OR (status='rendering' AND updated_at<?))",
+                (utc_now().isoformat(), episode_id, (utc_now() - RENDER_RETRY_AFTER).isoformat()),
+            ).rowcount
+        if not changed:
+            await report("هذه المسودة قيد الإنتاج أو تم التعامل معها مسبقاً.")
+            return
+        await report("تمت الموافقة على السيناريو. بدأ إنتاج المشاهد والصوت والمونتاج.")
+        try:
+            await render_video(episode_id)
+            if await send_episode_for_review(episode_id):
+                await report("اكتمل الفيديو وأرسلته للمراجعة. لن يُنشر على YouTube إلا بعد موافقتك على الفيديو النهائي.")
+            else:
+                await report(f"اكتمل الفيديو لكن تعذر إرساله تلقائياً. أعد الإرسال للمراجعة بالأمر /review {episode_id}")
+        except Exception as exc:
+            with db() as con:
+                con.execute(
+                    "UPDATE episodes SET status='failed',render_error=?,updated_at=? WHERE id=?",
+                    (str(exc)[:1000], utc_now().isoformat(), episode_id),
+                )
+            await report(f"فشل إنتاج الفيديو: {str(exc)[:700]}\nيمكن إعادة المحاولة من /status ثم /resume {episode_id}")
 
 
 async def run_today(report):
@@ -1110,7 +1374,7 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح.")
         return
     with db() as con:
-        rows = con.execute("SELECT episode_date,language,status,title,youtube_url,render_progress,render_error FROM episodes ORDER BY created_at DESC LIMIT 10").fetchall()
+        rows = con.execute("SELECT id,source,episode_date,language,status,title,youtube_url,render_progress,render_error FROM episodes ORDER BY created_at DESC LIMIT 10").fetchall()
         runs = con.execute(
             "SELECT language,status,error FROM daily_runs WHERE run_date=? ORDER BY language",
             (utc_now().date().isoformat(),),
@@ -1120,6 +1384,7 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + (f" ({r['render_progress']}%)" if r['status'] == "rendering" else "")
         + f" · {r['title']}"
         + (f"\nالخطأ: {r['render_error'][:250]}" if r['status'] == "failed" and r['render_error'] else "")
+        + (f"\nإعادة المحاولة: /resume {r['id']}" if r["source"] == "idea" and r["status"] == "failed" else "")
         + (f"\n{r['youtube_url']}" if r['youtube_url'] else "")
         for r in rows
     ]
@@ -1167,6 +1432,28 @@ async def tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "generate:today":
         await create_today(query.message)
+        return
+    if query.data == "idea:new":
+        context.user_data["idea_flow"] = {"step": "idea"}
+        await query.message.reply_text(
+            "أرسل فكرة الفيديو بجملة أو جملتين. بعدها تختار النوع والمدة واللغة والصوت، "
+            "وتراجع السيناريو قبل بدء الإنتاج.\n/cancel لإلغاء."
+        )
+        return
+    if query.data.startswith("idea:type:") or query.data.startswith("idea:duration:") or query.data.startswith("idea:language:") or query.data.startswith("idea:voice:"):
+        await tg_idea_selection(query, context, query.data.split(":"))
+        return
+    if query.data.startswith("idea:produce:"):
+        await produce_idea_episode(query.data.split(":", 2)[2], query.message.reply_text)
+        return
+    if query.data.startswith("idea:discard:"):
+        episode_id = query.data.split(":", 2)[2]
+        with db() as con:
+            changed = con.execute(
+                "UPDATE episodes SET status='rejected',updated_at=? WHERE id=? AND source='idea' AND status='draft'",
+                (utc_now().isoformat(), episode_id),
+            ).rowcount
+        await query.message.reply_text("تم حذف المسودة." if changed else "المسودة غير موجودة أو لم تعد قابلة للحذف.")
         return
     action, episode_id = query.data.split(":", 1)
     if action == "reject":
@@ -1219,13 +1506,17 @@ async def scheduler_loop():
 
 def register_telegram_handlers(application):
     application.add_handler(CommandHandler("start", tg_start))
+    application.add_handler(CommandHandler("new", tg_new))
+    application.add_handler(CommandHandler("cancel", tg_cancel))
     application.add_handler(CommandHandler("connect", tg_connect))
     application.add_handler(CommandHandler("today", tg_today, block=False))
     application.add_handler(CommandHandler("review", tg_review, block=False))
+    application.add_handler(CommandHandler("resume", tg_resume, block=False))
     application.add_handler(CommandHandler("status", tg_status))
     application.add_handler(CommandHandler("stats", tg_stats))
     application.add_handler(CallbackQueryHandler(tg_callback, pattern=r"^generate:today$", block=False))
     application.add_handler(CallbackQueryHandler(tg_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, tg_idea_text, block=False))
 
 
 @asynccontextmanager
