@@ -214,29 +214,48 @@ async def write_story(topic: str, language: str, model: str, avoid_titles=()):
         "Keep character names and events aligned between language versions. "
         "Return JSON with: title, description, moral, art_style (one English sentence describing a single consistent visual style), "
         "characters (1-3 objects with name and appearance; appearance is a detailed English description of face, colors and clothing), "
-        "and scenes: 5-7 objects, each having visual_description, narration, sound_effect. "
+        "and scenes: exactly 6 objects, each having visual_description, narration, sound_effect. "
+        "Write approximately 55 spoken words in each scene's narration; do not count other fields. "
         "Write each visual_description in English as a self-contained illustration prompt that names the characters present, the place and the action. "
         f"Narration must be in {language_name}, with a beginning, middle, happy ending, and positive lesson."
     )
+    system = "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    counts = []
     for attempt in range(3):
         try:
-            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."}, {"role": "user", "content": prompt}], response_format={"type": "json_object"})
+            response = await client.chat.completions.create(model=model, messages=messages, response_format={"type": "json_object"})
         except Exception as exc:
             if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
                 raise
-            response = await client.chat.completions.create(model=model, messages=[{"role": "system", "content": "Return valid JSON only. Create original safe children's stories."}, {"role": "user", "content": prompt}])
-        story = parse_json(response.choices[0].message.content or "{}")
+            response = await client.chat.completions.create(model=model, messages=messages)
+        content = response.choices[0].message.content or "{}"
+        story = parse_json(content)
         scenes = story.get("scenes")
-        narration = " ".join(
-            str(scene.get("narration", ""))
-            for scene in scenes
-            if isinstance(scene, dict)
-        ) if isinstance(scenes, list) else ""
+        usable_scenes = [
+            scene for scene in scenes
+            if isinstance(scene, dict) and str(scene.get("narration", "")).strip()
+        ][:8] if isinstance(scenes, list) else []
+        narration = " ".join(str(scene.get("narration", "")) for scene in usable_scenes)
         word_count = len(re.findall(r"\S+", narration))
+        counts.append(word_count)
         if min_words <= word_count <= max_words:
             return story
-        prompt += f"\nThe previous attempt had {word_count} spoken words. Regenerate it with {min_words}-{max_words} spoken words total."
-    raise RuntimeError(f"AI could not create a 2-3 minute story after 3 attempts (target: {min_words}-{max_words} spoken words).")
+        adjustment = "Expand" if word_count < min_words else "Shorten"
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": (
+                f"The usable scene narration contained {word_count} words. {adjustment} the narration "
+                f"to {min_words}-{max_words} words total, aiming for about 55 words in each of 6 scenes. "
+                "Keep the same characters and story, and return the complete corrected JSON."
+            )},
+        ]
+    raise RuntimeError(
+        f"AI could not create a story within {min_words}-{max_words} spoken words after 3 attempts "
+        f"(actual counts: {', '.join(map(str, counts))})."
+    )
 
 
 def character_sheet(story) -> str:
