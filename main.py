@@ -403,9 +403,9 @@ def make_caption_images(narration, language, duration, folder, index):
             else:
                 line = candidate
         lines.append(line)
-        image = Image.new("RGBA", (720, 70 * len(lines) + 40), (0, 0, 0, 0))
+        image = Image.new("RGBA", (720, 390), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((20, 0, 700, image.height - 1), radius=28, fill=(0, 0, 0, 150))
+        draw.rounded_rectangle((20, 0, 700, 70 * len(lines) + 39), radius=28, fill=(0, 0, 0, 150))
         for row, text in enumerate(lines):
             draw.text((360, 20 + 70 * row + 35), shape_text(text, language), font=caption_font, fill=(255, 255, 255, 255), anchor="mm")
         path = folder / f"caption-{index}-{number}.png"
@@ -413,6 +413,22 @@ def make_caption_images(narration, language, duration, folder, index):
         captions.append((path, cursor, cursor + span))
         cursor += span
     return captions
+
+
+def write_caption_playlist(captions, path):
+    entries = []
+    for image, start, end in captions:
+        entries.extend((f"file '{image.name}'", f"duration {end - start:.6f}"))
+    entries.append(f"file '{captions[-1][0].name}'")
+    path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+
+def ffmpeg_scene_error(result, index, total):
+    if result.returncode < 0:
+        reason = f"terminated by signal {-result.returncode} (check Railway logs and memory usage)"
+    else:
+        reason = f"exit code {result.returncode}"
+    return f"FFmpeg failed on scene {index+1}/{total}: {reason}. {result.stderr[-700:]}"
 
 
 def ensure_lullaby(path):
@@ -449,7 +465,7 @@ def make_sparkle(path):
     image.save(path)
 
 
-def animated_video_filter(index, sparkle_input, captions=()):
+def animated_video_filter(index, sparkle_input, caption_input=None, captions=()):
     # Alternate zoom-in / zoom-out per scene, with gentle sway, drifting bubbles and a fade-in.
     zoom = "min(1.10+0.0007*on,1.22)" if index % 2 == 0 else "max(1.22-0.0007*on,1.10)"
     graph = [
@@ -465,11 +481,15 @@ def animated_video_filter(index, sparkle_input, captions=()):
             f"[{previous}][s{i}]overlay=x='{x}+25*sin(t*1.4+{i})':y='H-mod(t*{speed}+{offset},H+60)':format=auto[o{i}]"
         )
         previous = f"o{i}"
-    for number, (input_index, start, end) in enumerate(captions):
-        graph.append(
-            f"[{previous}][{input_index}:v]overlay=x=0:y='900+24*max(0,1-(t-{start:.2f})/0.2)':enable='between(t,{start:.2f},{end:.2f})':format=auto[c{number}]"
+    if caption_input is not None:
+        motion = "+".join(
+            f"if(between(t,{start:.6f},{end:.6f}),max(0,1-(t-{start:.6f})/0.2),0)"
+            for _, start, end in captions
         )
-        previous = f"c{number}"
+        graph.append(
+            f"[{previous}][{caption_input}:v]overlay=x=0:y='900+24*({motion})':format=auto[captions]"
+        )
+        previous = "captions"
     graph.append(f"[{previous}]fade=t=in:st=0:d=0.3[vout]")
     return ";".join(graph)
 
@@ -551,7 +571,7 @@ async def render_video(episode_id: str):
         clip = job_dir / f"clip-{index}.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        command = ["ffmpeg", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music)]
         if IMAGE_PROVIDER == "cloudflare":
@@ -560,11 +580,11 @@ async def render_video(episode_id: str):
                 make_sparkle(sparkle)
             command += ["-loop", "1", "-framerate", "24", "-i", str(sparkle)]
             sparkle_input = 3
-            captions = []
-            for number, (caption_path, start, end) in enumerate(make_caption_images(scene["narration"], episode["language"], audio_duration(audio), job_dir, index)):
-                command += ["-loop", "1", "-framerate", "24", "-i", str(caption_path)]
-                captions.append((4 + number, start, end))
-            filters = [animated_video_filter(index, sparkle_input, captions)]
+            captions = make_caption_images(scene["narration"], episode["language"], audio_duration(audio), job_dir, index)
+            playlist = job_dir / f"captions-{index}.txt"
+            write_caption_playlist(captions, playlist)
+            command += ["-f", "concat", "-safe", "1", "-i", str(playlist)]
+            filters = [animated_video_filter(index, sparkle_input, 4, captions)]
             video_map = "[vout]"
         else:
             filters = ["[0:v]scale=720:1280,format=yuv420p[vout]"]
@@ -578,7 +598,7 @@ async def render_video(episode_id: str):
                     "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", str(clip)]
         result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=240)
         if result.returncode:
-            raise RuntimeError(f"FFmpeg failed: {result.stderr[-700:]}")
+            raise RuntimeError(ffmpeg_scene_error(result, index, len(scenes)))
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int((index+1)*90/len(scenes)), utc_now().isoformat(), episode_id))
         return clip
