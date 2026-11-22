@@ -1,0 +1,6 @@
+# Optional only: install if using MUSIC_MODE=generate/auto and commercial restrictions allow it.
+torch>=2.4,<3.0
+transformers>=4.46,<5.0
+accelerate>=1.0,<2.0
+sentencepiece>=0.2,<1.0
+protobuf>=4.25,<7.0

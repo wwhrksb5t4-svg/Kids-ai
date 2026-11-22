@@ -23,7 +23,9 @@ import arabic_reshaper
 import edge_tts
 import httpx
 import song_studio
+from pipeline import animation
 from bidi.algorithm import get_display
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -36,6 +38,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+load_dotenv()
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data"))).resolve()
 MEDIA_DIR = DATA_DIR / "media"
@@ -48,12 +51,22 @@ TOKEN_PATH = DATA_DIR / "google-token.json"
 FASTLLM_API_KEY = (os.getenv("FASTLLM_API_KEY") or "").strip()
 FASTLLM_BASE_URL = (os.getenv("FASTLLM_BASE_URL") or "https://fastllm.top/v1").strip().rstrip("/")
 FASTLLM_MODEL = (os.getenv("FASTLLM_MODEL") or "auto").strip()
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
+ADMIN_IDS = tuple(part.strip() for part in (os.getenv("ADMIN_IDS") or "").split(",") if part.strip())
+if any(not value.isdigit() for value in ADMIN_IDS):
+    raise ValueError("ADMIN_IDS must be comma-separated numeric Telegram user IDs.")
+if not ADMIN_TELEGRAM_ID and ADMIN_IDS:
+    ADMIN_TELEGRAM_ID = ADMIN_IDS[0]
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
+MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY") or "1")
+if MAX_UPLOADS_PER_DAY < 1:
+    raise ValueError("MAX_UPLOADS_PER_DAY must be positive.")
 APP_API_KEY = (os.getenv("APP_API_KEY") or "").strip()
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+YOUTUBE_CLIENT_SECRET = (os.getenv("YOUTUBE_CLIENT_SECRET") or "").strip()
 GOOGLE_REDIRECT_URI = (os.getenv("GOOGLE_REDIRECT_URI") or (PUBLIC_BASE_URL + "/youtube/oauth/callback" if PUBLIC_BASE_URL else "")).strip()
 DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
@@ -90,6 +103,7 @@ client = AsyncOpenAI(api_key=FASTLLM_API_KEY, base_url=FASTLLM_BASE_URL) if FAST
 telegram_app: Optional[Application] = None
 scheduler_task: Optional[asyncio.Task] = None
 production_worker_task: Optional[asyncio.Task] = None
+auto_studio = None
 
 
 def utc_now():
@@ -174,8 +188,8 @@ load_studio_settings()
 def validate_studio_settings(values):
     if values["image_provider"] not in ("cards", "cloudflare"):
         raise ValueError("مزود الصور يجب أن يكون cards أو cloudflare.")
-    if values["video_provider"] not in ("none", "fal", "hf", "blender"):
-        raise ValueError("مزود الفيديو يجب أن يكون none أو fal أو hf أو blender.")
+    if values["video_provider"] not in animation.VIDEO_PROVIDERS:
+        raise ValueError("مزود الفيديو غير مدعوم.")
     if values["song_provider"] not in ("tts", "fal"):
         raise ValueError("مزود الموسيقى يجب أن يكون tts أو fal.")
     if values["content_mode"] not in ("story", "song"):
@@ -184,12 +198,16 @@ def validate_studio_settings(values):
         re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
     ):
         raise ValueError("Cloudflare غير جاهز: أضف CLOUDFLARE_ACCOUNT_ID وCLOUDFLARE_API_TOKEN في Railway أولاً.")
-    if values["video_provider"] in ("fal", "hf") and values["image_provider"] != "cloudflare":
-        raise ValueError("تحريك fal وHugging Face يحتاج IMAGE_PROVIDER=cloudflare.")
+    if values["video_provider"] not in ("none", "blender") and values["image_provider"] != "cloudflare":
+        raise ValueError("تحريك المشاهد يحتاج IMAGE_PROVIDER=cloudflare.")
     if values["content_mode"] == "song" and values["image_provider"] != "cloudflare" and values["video_provider"] != "blender":
         raise ValueError("وضع الأغاني يحتاج IMAGE_PROVIDER=cloudflare أو VIDEO_PROVIDER=blender.")
-    if (values["video_provider"] == "fal" or values["song_provider"] == "fal") and not FAL_KEY:
-        raise ValueError("مزود fal يحتاج FAL_KEY في Railway.")
+    if values["video_provider"] in animation.FAL_PROVIDERS and not FAL_KEY:
+        raise ValueError("خدمات Kling وHailuo وPixVerse وVidu وDreamina وVeo عبر fal.ai تحتاج FAL_KEY في Railway.")
+    if values["video_provider"] == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
+        raise ValueError("Runway يحتاج RUNWAY_API_KEY في Railway.")
+    if values["song_provider"] == "fal" and not FAL_KEY:
+        raise ValueError("مزود fal للموسيقى يحتاج FAL_KEY في Railway.")
     if values["video_provider"] == "blender" and values["content_mode"] != "song":
         raise ValueError("Blender الحالي يدعم الأغاني فقط؛ اختر song قبل تفعيله.")
 
@@ -224,7 +242,7 @@ def set_studio_settings(changes):
 
 def admin_only(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and ADMIN_TELEGRAM_ID and str(user.id) == ADMIN_TELEGRAM_ID)
+    return bool(user and str(user.id) in set(ADMIN_IDS + ((ADMIN_TELEGRAM_ID,) if ADMIN_TELEGRAM_ID else ())))
 
 
 def check_admin_id(value: Optional[str]):
@@ -235,6 +253,16 @@ def check_admin_id(value: Optional[str]):
 
 
 def google_client_config():
+    if YOUTUBE_CLIENT_SECRET:
+        try:
+            config = json.loads(Path(YOUTUBE_CLIENT_SECRET).read_text(encoding="utf-8"))
+            web = config["web"]
+            if not web["client_id"] or not web["client_secret"] or not GOOGLE_REDIRECT_URI:
+                raise ValueError("Missing web OAuth client credentials or redirect URI.")
+            web["redirect_uris"] = [GOOGLE_REDIRECT_URI]
+            return {"web": web}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("YOUTUBE_CLIENT_SECRET must point to a valid Google web OAuth client JSON file.") from exc
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
         raise RuntimeError("Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and PUBLIC_BASE_URL in Railway.")
     return {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token", "redirect_uris": [GOOGLE_REDIRECT_URI]}}
@@ -444,14 +472,16 @@ def make_frame(scene, path, index, total, language):
 
 
 def check_image_provider():
-    if VIDEO_PROVIDER not in ("none", "fal", "hf", "blender"):
-        raise RuntimeError(f"VIDEO_PROVIDER must be none, fal, hf or blender (got {VIDEO_PROVIDER!r}).")
+    if VIDEO_PROVIDER not in animation.VIDEO_PROVIDERS:
+        raise RuntimeError(f"Unsupported VIDEO_PROVIDER: {VIDEO_PROVIDER!r}.")
     if VIDEO_PROVIDER == "blender":
         return
-    if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
-        raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
-    if VIDEO_PROVIDER == "fal" and not FAL_KEY:
-        raise RuntimeError("VIDEO_PROVIDER=fal requires FAL_KEY.")
+    if VIDEO_PROVIDER not in ("none",) and IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("Image-to-video providers require IMAGE_PROVIDER=cloudflare.")
+    if VIDEO_PROVIDER in animation.FAL_PROVIDERS and not FAL_KEY:
+        raise RuntimeError("This video provider requires FAL_KEY.")
+    if VIDEO_PROVIDER == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
+        raise RuntimeError("VIDEO_PROVIDER=runway requires RUNWAY_API_KEY.")
     if IMAGE_PROVIDER not in ("cards", "cloudflare"):
         raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
     if IMAGE_PROVIDER == "cloudflare" and not (
@@ -556,41 +586,10 @@ async def _cloudflare_frame(scene, path, size=(720, 1280), style=""):
 
 
 async def make_fal_motion(scene, image_path, path, size=(720, 1280)):
-    """Animate a scene image into a short looping clip via fal.ai image-to-video."""
-    motion = str(scene.get("motion") or scene.get("visual_description") or "").strip()
-    prompt = (
-        "Smooth 3D animated children's cartoon, characters move gently and happily, subtle camera motion, "
-        "no text, no logos. " + str(scene.get("character_sheet", ""))[:500] + " Action: " + motion
-    )[:1500]
-    data_uri = "data:image/png;base64," + base64.b64encode(image_path.read_bytes()).decode()
-    headers = {"Authorization": f"Key {FAL_KEY}"}
-    body = {"prompt": prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": "16:9" if size[0] > size[1] else "9:16"}
-    try:
-        async with httpx.AsyncClient(timeout=120) as http:
-            submit = await http.post(f"https://queue.fal.run/{FAL_VIDEO_MODEL}", headers=headers, json=body)
-            submit.raise_for_status()
-            job = submit.json()
-            deadline = asyncio.get_running_loop().time() + 600
-            while True:
-                status = (await http.get(job["status_url"], headers=headers)).json()
-                if status.get("status") == "COMPLETED":
-                    break
-                if status.get("status") not in ("IN_QUEUE", "IN_PROGRESS"):
-                    raise RuntimeError(f"fal.ai video generation failed: {str(status)[:300]}")
-                if asyncio.get_running_loop().time() > deadline:
-                    raise RuntimeError("fal.ai video generation timed out.")
-                await asyncio.sleep(5)
-            result = await http.get(job["response_url"], headers=headers)
-            result.raise_for_status()
-            video = await http.get(result.json()["video"]["url"])
-            video.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"fal.ai request failed (HTTP {exc.response.status_code}): {exc.response.text[:300]}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError("Could not reach fal.ai; try again.") from exc
-    except (KeyError, ValueError, TypeError) as exc:
-        raise RuntimeError("fal.ai returned an unexpected response.") from exc
-    await finalize_motion(video.content, path, size)
+    """Animate a scene with the selected hosted API, then normalize it for FFmpeg."""
+    await animation.animate_scene(
+        scene, image_path, path, provider=VIDEO_PROVIDER, size=size, db_path=DB_PATH
+    )
 
 
 async def finalize_motion(raw_bytes, path, size=(720, 1280)):
@@ -777,8 +776,9 @@ async def prepare_scene(scene, index, total, language, voice, job_dir):
             else:
                 await asyncio.to_thread(make_frame, scene, frame, index, total, language)
         if IMAGE_PROVIDER == "cloudflare":
-            if VIDEO_PROVIDER == "fal" and not motion.exists():
-                await make_fal_motion(scene, frame, motion)
+            if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
+                if not motion.exists():
+                    await make_fal_motion(scene, frame, motion)
             elif VIDEO_PROVIDER == "hf" and not motion.exists():
                 try:
                     await make_hf_motion(scene, frame, motion)
@@ -881,7 +881,7 @@ async def render_song_episode(episode, scenes, meta, job_dir, control=None):
 
     motion = None
     prebuilt_motion = None
-    if VIDEO_PROVIDER == "fal":
+    if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
         motion = lambda scene, frame, path: make_fal_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "hf":
         motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
@@ -997,7 +997,7 @@ async def render_video(episode_id: str):
         temporary_clip = job_dir / f"clip-{index}.tmp.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        use_motion = VIDEO_PROVIDER in ("fal", "hf") and (job_dir / f"motion-{index}.mp4").exists()
+        use_motion = VIDEO_PROVIDER in (*animation.FAL_PROVIDERS, "runway", "hf") and (job_dir / f"motion-{index}.mp4").exists()
         if use_motion:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(job_dir / f"motion-{index}.mp4"), "-i", str(audio)]
         else:
@@ -1220,6 +1220,22 @@ async def tg_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.message.reply_text("استخدم /resume متبوعاً بمعرّف مهمة متوقفة أو فاشلة.")
         return
+    if auto_studio:
+        message = None
+        with auto_studio.db() as con:
+            job = con.execute("SELECT status FROM auto_jobs WHERE id=?", (context.args[0],)).fetchone()
+            if job:
+                upload = con.execute("SELECT state FROM auto_uploads WHERE job_id=?", (context.args[0],)).fetchone()
+                if job["status"] != "failed":
+                    message = "المهمة التلقائية ليست فاشلة."
+                elif upload and upload["state"] not in ("pending", "complete"):
+                    message = "حالة النشر غير مؤكدة؛ تحقق من Telegram وYouTube قبل إعادة المحاولة لتجنب التكرار."
+                else:
+                    con.execute("UPDATE auto_jobs SET status='queued',error=NULL WHERE id=?", (context.args[0],))
+                    message = "تمت إعادة المهمة التلقائية إلى الطابور."
+        if message:
+            await update.message.reply_text(message)
+            return
     await produce_idea_episode(context.args[0], update.message.reply_text)
 
 
@@ -1300,9 +1316,6 @@ async def tg_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FROM production_jobs j JOIN episodes e ON e.id=j.episode_id "
             "ORDER BY j.created_at DESC LIMIT 15"
         ).fetchall()
-    if not rows:
-        await update.message.reply_text("طابور الإنتاج فارغ.")
-        return
     labels = {
         "queued": "بالانتظار", "running": "قيد الإنتاج", "paused": "متوقفة",
         "completed": "جاهزة للمراجعة", "failed": "فشلت", "cancelled": "ملغاة",
@@ -1321,6 +1334,15 @@ async def tg_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             line += f"\nلتسجيل تكلفة الفاتورة: /cost {row['episode_id']} USD"
         lines.append(line)
+    if auto_studio:
+        with auto_studio.db() as con:
+            automatic = con.execute(
+                "SELECT id,topic,status FROM auto_jobs WHERE status IN ('pending','queued','running') ORDER BY created_at LIMIT 15"
+            ).fetchall()
+        lines.extend(f"موضوع آلي · {row['status']} · {row['topic']}\n{row['id']}" for row in automatic)
+    if not lines:
+        await update.message.reply_text("طابور الإنتاج فارغ.")
+        return
     await update.message.reply_text("\n\n".join(lines)[:3900])
 
 
@@ -1400,7 +1422,7 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
     await update.message.reply_text(
-        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو من فكرتك\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nكل فيديو يحتاج موافقتك قبل النشر العام.",
+        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو بمراجعة قبل النشر\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/create TOPIC — إنتاج ونشر تلقائي\n/auto_on HOURS — تفعيل الجدولة التلقائية\n/auto_off — إيقاف الجدولة\n/queue — الطابور\n/status — الحالة\n/video_usage — استهلاك تحريك الفيديو اليومي\n/stats — إحصاءات YouTube\n\nمسار /new و/today يحتاج موافقتك للنشر؛ /create و/auto_on ينشران تلقائياً.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✨ إنشاء فيديو من فكرة", callback_data="idea:new")],
             [InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")],
@@ -1412,12 +1434,24 @@ def settings_keyboard():
     options = [
         ("نوع المحتوى", "content_mode", [("قصص", "story"), ("أغاني", "song")]),
         ("الصور", "image_provider", [("بطاقات", "cards"), ("Cloudflare AI", "cloudflare")]),
-        ("الفيديو", "video_provider", [("بدون تحريك", "none"), ("fal.ai", "fal"), ("Hugging Face", "hf"), ("Blender", "blender")]),
+        ("الفيديو", "video_provider", [
+            ("بدون تحريك", "none"), ("Kling عبر fal.ai", "kling"), ("Hailuo عبر fal.ai", "hailuo"),
+            ("PixVerse عبر fal.ai", "pixverse"), ("Vidu عبر fal.ai", "vidu"),
+            ("Seedance عبر fal.ai", "dreamina"), ("Runway API", "runway"),
+            ("Google Veo عبر fal.ai", "veo"), ("fal.ai مخصص", "fal"),
+            ("Hugging Face", "hf"), ("Blender", "blender"),
+        ]),
         ("الموسيقى", "song_provider", [("TTS وإيقاع", "tts"), ("غناء fal.ai", "fal")]),
     ]
     rows = []
     for label, key, values in options:
-        rows.append([InlineKeyboardButton(f"{label}: {name}", callback_data=f"settings:{key}:{value}") for name, value in values])
+        for start in range(0, len(values), 2):
+            rows.append([
+                InlineKeyboardButton(
+                    f"{label}: {name}", callback_data=f"settings:{key}:{value}"
+                )
+                for name, value in values[start:start + 2]
+            ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1818,6 +1852,21 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 line += f"\nالخطأ: {run['error'][:250]}"
             run_lines.append(line)
         lines = run_lines + (["\nآخر الحلقات:"] + lines if lines else [])
+    if auto_studio:
+        with auto_studio.db() as con:
+            last = con.execute("SELECT * FROM auto_jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            count = con.execute(
+                "SELECT COUNT(*) FROM auto_uploads WHERE upload_day=?", (utc_now().date().isoformat(),)
+            ).fetchone()[0]
+            queued = con.execute("SELECT COUNT(*) FROM auto_jobs WHERE status IN ('pending','queued','running')").fetchone()[0]
+        lines.append(
+            f"\nالإنتاج التلقائي: {'مفعّل' if auto_studio.setting('auto_enabled', '0') == '1' else 'متوقف'}"
+            f" · المواضيع المنتظرة/الجارية {queued} · رفع اليوم {count}/{MAX_UPLOADS_PER_DAY}"
+        )
+        if last:
+            lines.append(f"آخر مهمة: {last['topic']} · {last['status']}"
+                         + (f"\nالخطأ: {last['error'][:250]}" if last["error"] else "")
+                         + (f"\n{last['youtube_url']}" if last["youtube_url"] else ""))
     await update.message.reply_text("\n".join(lines) if lines else "لا توجد حلقات بعد.")
 
 
@@ -1933,9 +1982,10 @@ async def scheduler_loop():
                         done = con.execute("SELECT status FROM daily_runs WHERE run_date=? AND language=?", (now.date().isoformat(), language)).fetchone()
                     if not done or done["status"] == "failed":
                         try:
-                            row = await create_daily_episode(language, now.date())
-                            if row.get("status") in ("pending_review", "ready_for_review"):
-                                await send_episode_for_review(row["id"])
+                            async with generation_lock:
+                                row = await create_daily_episode(language, now.date())
+                                if row.get("status") in ("pending_review", "ready_for_review"):
+                                    await send_episode_for_review(row["id"])
                         except Exception as exc:
                             if telegram_app and ADMIN_TELEGRAM_ID:
                                 await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=f"فشل الإنتاج الآلي ({language}): {str(exc)[:700]}")
@@ -1952,6 +2002,7 @@ def register_telegram_handlers(application):
     application.add_handler(CommandHandler("new", tg_new))
     application.add_handler(CommandHandler("cancel", tg_cancel))
     application.add_handler(CommandHandler("queue", tg_queue))
+    application.add_handler(CommandHandler("cost", tg_cost))
     application.add_handler(CommandHandler("pause", tg_pause))
     application.add_handler(CommandHandler("stop", tg_stop))
     application.add_handler(CommandHandler("connect", tg_connect))
@@ -1968,16 +2019,31 @@ def register_telegram_handlers(application):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app, scheduler_task, production_worker_task
+    global telegram_app, scheduler_task, production_worker_task, auto_studio
     if TELEGRAM_BOT_TOKEN:
+        from pipeline.bot_commands import register_auto_handlers
+        from pipeline.scheduler import AutoStudio
+
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         register_telegram_handlers(telegram_app)
+        admins = sorted({int(item) for item in ADMIN_IDS + ((ADMIN_TELEGRAM_ID,) if ADMIN_TELEGRAM_ID else ())})
+        auto_studio = AutoStudio(
+            db_path=DB_PATH, data_dir=DATA_DIR, bot=telegram_app.bot, admin_ids=admins,
+            channel_id=CHANNEL_ID, max_uploads=MAX_UPLOADS_PER_DAY, youtube_services=youtube_services,
+            compress_for_telegram=compress_for_telegram, generation_lock=generation_lock,
+            video_provider=lambda: VIDEO_PROVIDER,
+        )
+        register_auto_handlers(telegram_app, auto_studio, admin_only)
         await telegram_app.initialize()
         await telegram_app.start()
+        await auto_studio.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         scheduler_task = asyncio.create_task(scheduler_loop())
         production_worker_task = asyncio.create_task(production_worker_loop())
     yield
+    if auto_studio:
+        await auto_studio.stop()
+        auto_studio = None
     for task in (scheduler_task, production_worker_task):
         if not task:
             continue
@@ -1997,7 +2063,7 @@ app = FastAPI(title="Kids Haven Telegram & YouTube Studio", version="2.0.0", lif
 
 @app.get("/", include_in_schema=False)
 async def home():
-    return HTMLResponse("<html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Kids Haven Studio</title><body style='font:18px system-ui;max-width:720px;margin:50px auto;padding:20px'><h1>🌊 Kids Haven Studio</h1><p>بوت Telegram لإنشاء ومراجعة فيديوهات عربية وإنجليزية، مع ربط YouTube رسميًا.</p><p>اضبط أسرار Railway ثم ابدأ البوت بأمر /start. لا يتم نشر الفيديو تلقائيًا: يجب ضغط موافقة النشر في Telegram.</p><p><a href='/docs'>توثيق API</a> · <a href='/health'>حالة الخدمة</a></p></body></html>")
+    return HTMLResponse("<html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Kids Haven Studio</title><body style='font:18px system-ui;max-width:720px;margin:50px auto;padding:20px'><h1>🌊 Kids Haven Studio</h1><p>بوت Telegram لإنشاء ومراجعة فيديوهات عربية وإنجليزية، مع ربط YouTube رسميًا.</p><p>مسار المراجعة يحتاج موافقة قبل النشر. أوامر الإنتاج التلقائي تنشر بعد تفعيلها صراحةً.</p><p><a href='/docs'>توثيق API</a> · <a href='/health'>حالة الخدمة</a></p></body></html>")
 
 
 @app.get("/health")
@@ -2177,7 +2243,7 @@ function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(
 async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
 async function post(p,body){const r=await fetch(p,{method:'POST',headers:{'x-api-key':sessionStorage.getItem('k')||'','Content-Type':'application/json'},body:JSON.stringify(body||{})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);return j}
 function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
-const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['fal','fal.ai'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
+const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['kling','Kling via fal.ai'],['hailuo','Hailuo via fal.ai'],['pixverse','PixVerse via fal.ai'],['vidu','Vidu via fal.ai'],['dreamina','Seedance via fal.ai'],['runway','Runway API'],['veo','Google Veo via fal.ai'],['fal','fal.ai custom'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
 function drawProviders(settings){const c=$('providerControls');c.replaceChildren();for(const [key,label] of [['content_mode','نوع المحتوى'],['image_provider','الصور'],['video_provider','الفيديو'],['song_provider','الموسيقى']]){const wrap=document.createElement('label');wrap.append(el('div',label));const s=document.createElement('select');s.dataset.setting=key;for(const [value,name] of providerOptions[key]){const o=document.createElement('option');o.value=value;o.textContent=name;s.append(o)}s.value=settings[key];wrap.append(s);c.append(wrap)}}
 async function saveProviders(){const payload={};document.querySelectorAll('[data-setting]').forEach(x=>payload[x.dataset.setting]=x.value);try{const r=await post('/studio/settings',payload);$('providerMsg').textContent='تم الحفظ';drawProviders(r.settings);load()}catch(e){$('providerMsg').textContent=e.message}}
 async function jobAction(id,action){try{await post('/studio/queue/'+encodeURIComponent(id)+'/'+action,{});load()}catch(e){$('genmsg').textContent=e.message}}

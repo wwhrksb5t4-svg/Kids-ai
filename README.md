@@ -6,7 +6,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 
 - Creates one Arabic and one English original episode per day at configured UTC times (defaults 12:00 and 14:00). Each script targets 300-360 spoken words; actual duration depends on narration speed. If the story is outside that range, the model is asked to revise it, up to three attempts.
 - Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model.
-- Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
+- The existing `/new` and `/today` flows upload to YouTube **only after admin approval**. The separate automatic nursery-rhyme flow below publishes when explicitly started via `/create` or enabled with `/auto_on`.
 - `/new` or the `/start` button accepts a user idea and offers story, educational, and adventure scripts; short or 2-3 minute duration; Arabic or English; and the configured primary or alternate voice. The bot sends a script and scene-outline preview first. Only after approving production does it render and send the video for a separate YouTube publish approval.
 - `/settings` switches among the configured content, image, video and song providers in Telegram; the dashboard offers the same persistent settings. Values saved there override environment defaults. Credentials are validated but never shown.
 - `/today` manually generates scheduled episodes; `/status` lists recent episodes; `/queue` shows persisted production jobs; `/pause ID`, `/resume ID` and `/stop ID` control approved idea-video jobs; `/cancel` cancels an unfinished `/new` setup; `/cost ID USD` records actual provider charges manually; `/stats` queries YouTube Analytics.
@@ -42,6 +42,27 @@ DAILY_EN_TIME=14:00
 # Optional: leave unset to rotate through 12 built-in themes
 # DAILY_TOPIC=
 ```
+
+## Automatic nursery-rhyme pipeline
+
+This is a separate, opt-in workflow; existing `/new`, `/today`, OAuth, dashboard, and review flows remain available. `/create TOPIC` queues an immediate job **that publishes automatically**. `/auto_on HOURS` enables periodic automatic publication; `/auto_off` stops future scheduled jobs and cancels queued automatic jobs. An upload already in flight may finish. The bot must be an administrator of the Telegram channel.
+
+1. Copy `.env.example` to `.env` for local use, and set `DATA_DIR=./data`. Set `BOT_TOKEN` (or the existing `TELEGRAM_BOT_TOKEN`), `ADMIN_IDS` as comma-separated numeric user IDs, `CHANNEL_ID`, `GEMINI_API_KEY`, `MAX_UPLOADS_PER_DAY`, `CLOUDFLARE_ACCOUNT_ID`, and `CLOUDFLARE_API_TOKEN`. `GROQ_API_KEY` is an optional text fallback. Gemini, Groq, and Cloudflare quotas and billing policies can change; free usage is not guaranteed. Never send keys to the bot.
+2. Set `PUBLIC_BASE_URL` to a reachable HTTPS URL and use the existing Google Web OAuth setup and `/connect`. Either configure `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, or set `YOUTUBE_CLIENT_SECRET` to the path of a Google **web client** JSON file. The OAuth token and generated character library are stored under `DATA_DIR`. Protect the directory and mount it persistently on Railway.
+3. Put music you have the right to use in `DATA_DIR/music`, or set `MUSIC_LIBRARY_PATH` to an existing folder such as `assets/music`. Supported formats include MP3 and WAV. Check each track's commercial-use and attribution requirements yourself.
+4. Install the dependencies with `pip install -r requirements.txt` and install FFmpeg/ffprobe. Run `uvicorn main:app --host 0.0.0.0 --port 8000`. Or run `docker compose up --build` after preparing `.env` and `data/`. Normal image/video generation is remote; PyTorch is not installed or needed on Railway or on the iPhone used to control Telegram.
+5. In Railway, select `VIDEO_PROVIDER` and add `FAL_KEY` for Kling/Hailuo/PixVerse/Vidu/Seedance/Veo, or `RUNWAY_API_KEY` for Runway. `VIDEO_API_MAX_SCENES_PER_DAY=8` and `VIDEO_API_DAILY_BUDGET_USD=10` are the default daily guards. The budget guard uses conservative per-scene estimates (customizable with `VIDEO_ESTIMATED_COST_<PROVIDER>_USD`) and is not a guaranteed invoice cap; actual prices, models, durations, and rounding differ. In the private admin chat, use `/setlang ar`, `/setmusic library`, `/addtopic TOPIC`, and `/auto_on 24`; or use `/create TOPIC` for an immediate publication. `/queue` includes waiting topics; `/status` includes automatic jobs and errors; `/video_usage` reports today's request count and estimated spend. `/resume ID` retries a failed job when its publication state is safe to retry.
+6. `/characters`, `/newchar IDEA`, `/preview ID`, and `/delchar ID` manage the original character library. Changes persist in `DATA_DIR/characters.json`.
+
+The automatic nursery pipeline generates its scene art remotely with Cloudflare Workers AI (`CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`). The model seed does not guarantee identical character faces across images; the fixed character descriptions and generated reference frames improve consistency but cannot guarantee it. Cloudflare's free allocation, availability, and pricing can change.
+
+The default requirements intentionally omit PyTorch and local image/video models. The optional `requirements-local-musicgen.txt` is only for local MusicGen under the noncommercial-license restrictions described below. It is not needed to run the bot or control it from an iPhone. For Oracle Cloud Always Free, install Docker and Compose, copy the repository and `.env` securely, and mount persistent storage; verify VM and provider limits before relying on any free tier.
+
+`MUSIC_MODE=library` is the default. `generate` uses local `facebook/musicgen-small`, and `auto` tries it before the library. To run MusicGen, separately install `pip install -r requirements-local-musicgen.txt`; this optional install includes PyTorch and is not required for the bot, Cloudflare image generation, or video APIs. MusicGen model weights are [CC-BY-NC-4.0](https://huggingface.co/facebook/musicgen-small), **not licensed for commercial use**. Generation is disabled unless `MUSICGEN_NONCOMMERCIAL_CONFIRMED=1`; only set it after checking that your intended use complies. `auto` uses the library when confirmation is absent. This system cannot establish copyright clearance for generated content or external music.
+
+The automatic renderer outputs 1920×1080 with burned-in captions, upscaling 1280×720 source images. With `VIDEO_PROVIDER=none`, Ken Burns is camera movement over still images; configured image-to-video providers create moving clips, which are looped forward and backward beneath narration. Edge TTS speaks rather than sings the lyrics. Character descriptions and seeds improve repeatability but do not guarantee visual identity or original melodies. The originality guard checks known names and close spellings; it cannot detect all copyrighted similarities. Review the content and rights before using automatic publishing. The upload limit applies to this new automatic workflow; it does not count uploads made through the pre-existing manual workflow.
+
+Automatic jobs, settings, per-destination publication states, and quota reservations are saved in SQLite. On restart interrupted jobs are requeued and completed scene files reused. If an upload or Telegram send has an uncertain outcome, the job is stopped rather than automatically repeated: inspect the channel and YouTube first to avoid duplicate publication. Only files within a completed automatic job's work directory are removed.
 
 Optional: `BACKGROUND_MUSIC_PATH=/app/data/music/licensed-track.mp3` for music you have rights to use. Without this variable, the video has narration only.
 
@@ -79,22 +100,26 @@ Do not send Google passwords, OAuth tokens, or provider keys to anyone. Revoke O
 
 ### Animated scenes (fal.ai image-to-video)
 
-Set `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=fal` and `FAL_KEY` (from fal.ai dashboard). Each scene image is animated into a 5-second clip (`FAL_VIDEO_MODEL`, default Kling 2.1 standard) that plays forward and backward under the narration. This adds fal.ai cost per scene (about 6 clips per episode); check their pricing. Failures fail the render visibly; completed clips are reused on retry.
+Choose an image-to-video provider from Telegram `/settings` or the dashboard. Kling, Hailuo, PixVerse, Vidu, Dreamina/Seedance, and Google Veo use their documented image-to-video models hosted by fal.ai and require `FAL_KEY`. Runway uses its official developer API and requires `RUNWAY_API_KEY`. Set the key in Railway's Variables; do not send it to the bot. These API accounts and credits are separate from consumer-app free credits; generations are paid and the rates can change. Google Flow and Dreamina's consumer websites are not automated: the choices call Veo and Seedance APIs instead. API failures are reported rather than silently replaced with a still image; completed scene clips are reused on retry.
 
-Free option: `VIDEO_PROVIDER=hf` animates scenes through a public Hugging Face Space (`HF_SPACE`, `HF_API_NAME`, optional `HF_TOKEN` for a better free quota). It is slow, queued and unreliable; any scene that fails falls back to the zoom animation. The default Space's API arguments are unverified and may change, so test with `/today`.
+Set `VIDEO_API_MAX_SCENES_PER_DAY` (default `8`) and `VIDEO_API_DAILY_BUDGET_USD` (default `$10`) to limit paid scene-generation usage across existing and automatic workflows. Failed requests count toward both guards. Budget reservation uses per-scene estimates, and is **not a guaranteed dollar-spend cap**: actual model rates, output duration, provider-side rounding, or price changes can result in different charges. Check the linked provider pricing before enabling a model. Existing `/new` and `/today` still require review and explicit YouTube approval; `/create` and `/auto_on` keep their separate automatic-publishing behavior.
+
+Provider reference pages: [Kling](https://fal.ai/models/fal-ai/kling-video/v3/pro/image-to-video), [Hailuo](https://fal.ai/models/fal-ai/minimax/hailuo-2.3-fast/standard/image-to-video), [PixVerse](https://fal.ai/models/fal-ai/pixverse/v6/image-to-video), [Vidu](https://fal.ai/models/fal-ai/vidu/q4/image-to-video), [Dreamina/Seedance](https://fal.ai/models/bytedance/seedance-2.0/fast/image-to-video), [Veo](https://fal.ai/models/fal-ai/veo3.1/image-to-video), [Runway API](https://docs.dev.runwayml.com/).
+
+Optional experiment: `VIDEO_PROVIDER=hf` uses a public Hugging Face Space (`HF_SPACE`, `HF_API_NAME`, optional `HF_TOKEN`). It is slow and unreliable, and Space interfaces can change; it is not the recommended production adapter.
 
 ## Song mode (default): original kids-song music videos
 
 `CONTENT_MODE=song` (default) makes 16:9 sing-along videos of about 1-2 minutes, modelled on what top nursery-rhyme channels do: one recurring cute character, simple AABB rhymes, a chorus repeated 3 times, bright glossy 3D-style scenes and big on-screen lyrics. Songs are original; no existing franchise or song is copied. Set `CONTENT_MODE=story` for the previous narrated stories.
 
-- Recommended settings: `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=hf` (free) or `fal` (paid, better), `SONG_PROVIDER=tts` (free) or `fal` (real AI-sung track with `FAL_KEY`).
+- Recommended settings: `IMAGE_PROVIDER=cloudflare`, `VIDEO_PROVIDER=kling` or another configured API (paid), and `SONG_PROVIDER=tts` (no local model) or `fal` (AI-sung track with `FAL_KEY`).
 - `tts` is a child-like voice reading each line on a beat over a synthesized backing: it is not real singing. For a sung vocal use `SONG_PROVIDER=fal` (ACE-Step on fal.ai; unverified request schema, set `FAL_MUSIC_MODEL` if needed). With `fal`, lyric timing across scenes is approximate.
 - YouTube upload adds lyrics, tags and kids-song hashtags. Review every video first; AI images and voices can be flawed.
 - Honest limits: 3D look comes from AI images plus short image-to-video clips, not a studio animation pipeline; matching CoComelon quality is not realistic.
 
 ## Schedule and publishing
 
-Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set times appropriate for your audience. The scheduler generates a draft/video at those times, then sends it to Telegram. No video is automatically published without the explicit approval button.
+Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. The existing daily scheduler sends drafts to Telegram and requires approval before publishing. The separate opt-in automatic workflow publishes without per-video approval.
 
 ## Web endpoints
 
