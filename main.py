@@ -971,8 +971,8 @@ async def pipeline_scenes(scenes, prepare, render):
 async def render_song_episode(episode, scenes, meta, job_dir, control=None):
     if IMAGE_PROVIDER != "cloudflare":
         raise RuntimeError("Song videos need AI-generated scene images.")
-    validation_error = validate_story_scenes(
-        scenes, load_characters(character_library_path()), len(scenes)
+    validation_error = song_studio._validate(
+        {"sections": scenes}, load_characters(character_library_path()), episode["language"]
     )
     if validation_error:
         raise RuntimeError(f"Saved song scene is incompatible with the character bible: {validation_error}")
@@ -1076,11 +1076,12 @@ async def render_video(episode_id: str):
     scenes = json.loads(episode["scenes"])
     if not isinstance(scenes, list) or not scenes:
         raise RuntimeError("Episode has no renderable scene list.")
-    validation_error = validate_story_scenes(
-        scenes, load_characters(character_library_path()), len(scenes)
-    )
-    if validation_error:
-        raise RuntimeError(f"Saved episode scene is incompatible with the character bible: {validation_error}")
+    if episode_meta.get("kind") != "song":
+        validation_error = validate_story_scenes(
+            scenes, load_characters(character_library_path()), len(scenes)
+        )
+        if validation_error:
+            raise RuntimeError(f"Saved episode scene is incompatible with the character bible: {validation_error}")
     check_image_provider()
     if not subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0:
         raise RuntimeError("FFmpeg is missing")

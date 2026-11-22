@@ -854,6 +854,58 @@ class SceneAnimationTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["sections"][0]["lines"][0].startswith("Mimo, "))
         self.assertEqual(main.song_studio._validate(result, main.load_characters()), "")
 
+    async def test_failed_daily_song_retries_saved_scenes_with_song_validation(self):
+        song = self.song_with_names(named_sections=4)
+        song["sections"][0]["lines"][0] = "Shares the bright yellow ball"
+        song["sections"][0]["visual_description"] = "Mimo explores place 0"
+        scenes = main.song_studio.normalize_sections(song, "character sheet")
+        serialized = json.dumps(scenes)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(main, "DB_PATH", root / "episodes.sqlite3"), \
+                 patch.object(main, "WORK_DIR", root / "work"), \
+                 patch.object(main, "MEDIA_DIR", root / "media"), \
+                 patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
+                 patch.object(main, "SONG_PROVIDER", "tts"), \
+                 patch.object(main, "VIDEO_PROVIDER", "none"), \
+                 patch.object(main, "check_image_provider"), \
+                 patch.object(main.subprocess, "run", return_value=SimpleNamespace(returncode=0)), \
+                 patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(root / "song.m4a", [])), \
+                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
+                 patch.object(main, "create_video_thumbnail"), \
+                 patch.object(main, "select_model", new_callable=AsyncMock) as select_model:
+                main.init_db()
+                with main.db() as con:
+                    con.execute(
+                        "INSERT INTO episodes(id,episode_date,language,topic,title,description,script,scenes,status,created_at,updated_at,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        ("saved-song", "2026-11-22", "ar", "sea", "song", "", "",
+                         serialized, "failed", "2026-11-22T00:00:00+00:00",
+                         "2026-11-22T00:00:00+00:00", json.dumps({"kind": "song"})),
+                    )
+                result = await main.create_daily_episode("ar", date(2026, 11, 22))
+                with main.db() as con:
+                    stored = con.execute(
+                        "SELECT scenes, status FROM episodes WHERE id=?", ("saved-song",)
+                    ).fetchone()
+                self.assertEqual(result["status"], "pending_review")
+                self.assertEqual(stored["scenes"], serialized)
+                self.assertEqual(stored["status"], "pending_review")
+                select_model.assert_not_awaited()
+                render.assert_awaited_once()
+
+    async def test_saved_song_rejects_invalid_character_before_rendering(self):
+        song = self.song_with_names()
+        song["sections"][0]["character_ids"] = ["unknown"]
+        scenes = main.song_studio.normalize_sections(song, "character sheet")
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
+             patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock) as voice:
+            with self.assertRaisesRegex(RuntimeError, "valid character_ids"):
+                await main.render_song_episode(
+                    {"id": "song", "language": "ar"}, scenes, {}, Path(directory)
+                )
+            voice.assert_not_awaited()
+
     def test_video_provider_no_longer_exposes_blender(self):
         self.assertNotIn("blender", main.animation.VIDEO_PROVIDERS)
 
