@@ -2,6 +2,7 @@
   {
     "id": "mimo",
     "name": "Mimo",
+    "gender": "female",
     "species": "rabbit",
     "age_role": "young friend",
     "fixed_visual_description": "A small round lavender rabbit with a cream muzzle and belly, long rounded ears with pale pink inner ears, large round dark brown eyes, a mint-green romper, and one yellow star-shaped hair clip.",
@@ -14,6 +15,7 @@
   {
     "id": "tavi",
     "name": "Tavi",
+    "gender": "male",
     "species": "turtle",
     "age_role": "young helper",
     "fixed_visual_description": "A small round turquoise turtle with a smooth moss-green shell, a pale peach face and belly, large round dark brown eyes, a coral-orange vest, and one blue leaf-shaped backpack.",
@@ -26,6 +28,7 @@
   {
     "id": "nori",
     "name": "Nori",
+    "gender": "female",
     "species": "bird",
     "age_role": "young playmate",
     "fixed_visual_description": "A small round sky-blue bird with a pale yellow beak and belly, short rounded wings, large round dark brown eyes, violet overalls, and one orange crescent-shaped cap.",
@@ -38,6 +41,7 @@
   {
     "id": "pelo",
     "name": "Pelo",
+    "gender": "male",
     "species": "hedgehog",
     "age_role": "young friend",
     "fixed_visual_description": "A small round peach hedgehog with short soft chocolate-brown spines, a cream muzzle and belly, large round dark brown eyes, a pale blue shirt and plum shorts, and one green acorn-shaped satchel.",

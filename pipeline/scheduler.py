@@ -13,7 +13,7 @@ from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from pipeline import animation, images, music, publish, script, voice, video
-from pipeline.characters import DEFAULT_LIBRARY, build_image_prompt, get_seed
+from pipeline.characters import DEFAULT_LIBRARY, build_image_prompt, get_seed, load_characters
 from pipeline.guard import check_originality
 
 
@@ -195,6 +195,22 @@ class AutoStudio:
                 script_path = directory / "script.json"
                 if script_path.is_file():
                     story = json.loads(script_path.read_text(encoding="utf-8"))
+                    library = load_characters(self.character_path)
+                    by_id = {item["id"]: item for item in library}
+                    try:
+                        allowed = {
+                            character_id
+                            for scene in story["scenes"]
+                            for character_id in scene["character_ids"]
+                        }
+                        script._validate_script(story, allowed, by_id)
+                    except (KeyError, TypeError, ValueError):
+                        story = await script.create_script(
+                            job["topic"], job["language"] or "ar", character_path=self.character_path
+                        )
+                        temporary = directory / "script.tmp.json"
+                        temporary.write_text(json.dumps(story, ensure_ascii=False), encoding="utf-8")
+                        temporary.replace(script_path)
                 else:
                     story = await script.create_script(
                         job["topic"], job["language"] or "ar", character_path=self.character_path
@@ -207,15 +223,21 @@ class AutoStudio:
                 provider = self.video_provider()
                 for index, scene in enumerate(story["scenes"]):
                     await self.notify(f"المهمة {job['id']}: الصورة والصوت للمشهد {index + 1}/{len(story['scenes'])}.")
-                    picture = directory / f"picture-{index}.png"
-                    audio = directory / f"voice-{index}.mp3"
-                    motion = directory / f"motion-{index}.mp4"
+                    picture = directory / f"picture-v2-{index}.png"
+                    audio = directory / f"voice-v2-{index}.mp3"
+                    motion = directory / f"motion-v2-{index}.mp4"
                     if not picture.is_file():
-                        prompt = build_image_prompt(scene["visual_description"], scene["character_ids"], path=self.character_path)
+                        action = (
+                            f"Location: {scene['location']}. Camera angle: {scene['camera_angle']}. "
+                            f"Action: {scene['visual_description']}"
+                        )
+                        prompt = build_image_prompt(
+                            action, scene["character_ids"], path=self.character_path
+                        )
                         await images.generate_image(prompt, get_seed(scene["character_ids"][0], path=self.character_path), picture)
                     if not audio.is_file():
                         await voice.generate_voice(scene, language, audio, character_path=self.character_path)
-                    if provider not in ("none", "hf", "blender") and not motion.is_file():
+                    if provider not in ("none", "hf") and not motion.is_file():
                         await self.notify(f"المهمة {job['id']}: تحريك المشهد {index + 1}/{len(story['scenes'])} عبر {provider}.")
                         await animation.animate_scene(
                             scene, picture, motion, provider=provider, db_path=self.db_path
@@ -224,8 +246,6 @@ class AutoStudio:
                         from main import make_hf_motion
 
                         await make_hf_motion(scene, picture, motion)
-                    elif provider == "blender":
-                        raise RuntimeError("Blender loops are not available in the automatic nursery pipeline.")
                     pictures.append(picture)
                     voices.append(audio)
                     motions.append(motion if motion.is_file() else None)

@@ -23,7 +23,8 @@ import arabic_reshaper
 import edge_tts
 import httpx
 import song_studio
-from pipeline import animation
+from pipeline import animation, images as scene_images, video as scene_video
+from pipeline.characters import DEFAULT_LIBRARY, build_image_prompt, get_seed, load_characters
 from bidi.algorithm import get_display
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -34,7 +35,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from openai import AsyncOpenAI
-from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageStat, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -79,10 +80,10 @@ VOICE_EN = (os.getenv("VOICE_EN") or "en-US-GuyNeural").strip()
 VOICE_RATE = (os.getenv("VOICE_RATE") or "-5%").strip()
 VOICE_PITCH = (os.getenv("VOICE_PITCH") or "+0Hz").strip()
 BACKGROUND_MUSIC_PATH = (os.getenv("BACKGROUND_MUSIC_PATH") or "").strip()
-IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cards").strip().lower()
+IMAGE_PROVIDER = (os.getenv("IMAGE_PROVIDER") or "cloudflare").strip().lower()
 CLOUDFLARE_ACCOUNT_ID = (os.getenv("CLOUDFLARE_ACCOUNT_ID") or "").strip()
 CLOUDFLARE_API_TOKEN = (os.getenv("CLOUDFLARE_API_TOKEN") or "").strip()
-VIDEO_PROVIDER = {"huggingface": "hf", "fal.ai": "fal", "": "none"}.get((os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower(), (os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower())
+VIDEO_PROVIDER = {"huggingface": "hf", "fal.ai": "fal", "blender": "none", "": "none"}.get((os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower(), (os.getenv("VIDEO_PROVIDER") or "none").strip().strip("'\"").lower())
 FAL_KEY = (os.getenv("FAL_KEY") or "").strip()
 FAL_VIDEO_MODEL = (os.getenv("FAL_VIDEO_MODEL") or "fal-ai/kling-video/v2.1/standard/image-to-video").strip().strip("/")
 HF_SPACE = (os.getenv("HF_SPACE") or "Lightricks/ltx-video-distilled").strip()
@@ -108,6 +109,11 @@ auto_studio = None
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+def character_library_path():
+    saved = DATA_DIR / "characters.json"
+    return saved if saved.is_file() else DEFAULT_LIBRARY
 
 
 def db():
@@ -177,7 +183,11 @@ def load_studio_settings():
     with db() as con:
         settings = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM studio_settings")}
     IMAGE_PROVIDER = settings.get("image_provider", IMAGE_PROVIDER)
+    if IMAGE_PROVIDER == "cards":
+        IMAGE_PROVIDER = "cloudflare"
     VIDEO_PROVIDER = settings.get("video_provider", VIDEO_PROVIDER)
+    if VIDEO_PROVIDER == "blender":
+        VIDEO_PROVIDER = "none"
     SONG_PROVIDER = settings.get("song_provider", SONG_PROVIDER)
     CONTENT_MODE = settings.get("content_mode", CONTENT_MODE)
 
@@ -186,30 +196,22 @@ load_studio_settings()
 
 
 def validate_studio_settings(values):
-    if values["image_provider"] not in ("cards", "cloudflare"):
-        raise ValueError("مزود الصور يجب أن يكون cards أو cloudflare.")
-    if values["video_provider"] not in animation.VIDEO_PROVIDERS:
+    if values["image_provider"] != "cloudflare":
+        raise ValueError("صور المشاهد يجب أن تُولّد بالذكاء الاصطناعي عبر Cloudflare أو Pollinations.")
+    if values["video_provider"] == "blender" or values["video_provider"] not in animation.VIDEO_PROVIDERS:
         raise ValueError("مزود الفيديو غير مدعوم.")
     if values["song_provider"] not in ("tts", "fal"):
         raise ValueError("مزود الموسيقى يجب أن يكون tts أو fal.")
     if values["content_mode"] not in ("story", "song"):
         raise ValueError("نوع المحتوى يجب أن يكون story أو song.")
-    if values["image_provider"] == "cloudflare" and not (
-        re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
-    ):
-        raise ValueError("Cloudflare غير جاهز: أضف CLOUDFLARE_ACCOUNT_ID وCLOUDFLARE_API_TOKEN في Railway أولاً.")
-    if values["video_provider"] not in ("none", "blender") and values["image_provider"] != "cloudflare":
+    if values["video_provider"] != "none" and values["image_provider"] != "cloudflare":
         raise ValueError("تحريك المشاهد يحتاج IMAGE_PROVIDER=cloudflare.")
-    if values["content_mode"] == "song" and values["image_provider"] != "cloudflare" and values["video_provider"] != "blender":
-        raise ValueError("وضع الأغاني يحتاج IMAGE_PROVIDER=cloudflare أو VIDEO_PROVIDER=blender.")
     if values["video_provider"] in animation.FAL_PROVIDERS and not FAL_KEY:
         raise ValueError("خدمات Kling وHailuo وPixVerse وVidu وDreamina وVeo عبر fal.ai تحتاج FAL_KEY في Railway.")
     if values["video_provider"] == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
         raise ValueError("Runway يحتاج RUNWAY_API_KEY في Railway.")
     if values["song_provider"] == "fal" and not FAL_KEY:
         raise ValueError("مزود fal للموسيقى يحتاج FAL_KEY في Railway.")
-    if values["video_provider"] == "blender" and values["content_mode"] != "song":
-        raise ValueError("Blender الحالي يدعم الأغاني فقط؛ اختر song قبل تفعيله.")
 
 
 def set_studio_settings(changes):
@@ -363,16 +365,30 @@ async def write_story(
         raise ValueError("Story length or scene count is outside supported limits.")
     duration_text = "about 45-60 seconds" if max_words <= 160 else "about 2-3 minutes"
     avoid = f" Do not reuse the plots or titles of these earlier episodes: {'; '.join(avoid_titles)}." if avoid_titles else ""
+    character_bible = load_characters(character_library_path())
+    bible_choices = [
+        {
+            "id": item["id"], "name": item["name"], "gender": item["gender"],
+            "species": item["species"], "fixed_visual_description": item["fixed_visual_description"],
+        }
+        for item in character_bible
+    ]
     prompt = (
         f"Write an original gentle cartoon episode for children ages 4-8 in {language_name}. Theme: {topic}.{avoid} "
         f"The combined spoken narration must contain {min_words}-{max_words} words so the finished narrated video lasts {duration_text}. "
         "Use original characters and never copy copyrighted franchises. No frightening scenes, violence, or unsafe instructions. "
-        "Keep character names and events aligned between language versions. "
+        "Keep character names and events aligned between language versions. Use only characters from "
+        "this character bible; appearance, clothing, colors and gender are fixed. Include the exact "
+        "character name in each scene narration, with grammatically correct gendered wording. "
+        f"Character bible: {json.dumps(bible_choices, ensure_ascii=False)}. "
         "Return JSON with: title, description, moral, art_style (one English sentence describing a single consistent visual style), "
-        "characters (1-3 objects with name and appearance; appearance is a detailed English description of face, colors and clothing), "
-        f"and scenes: exactly {scene_count} objects, each having visual_description, motion (one English sentence describing the characters' movement), narration, sound_effect. "
+        f"and scenes: exactly {scene_count} objects, each having character_ids (array of character-bible IDs), "
+        "location (specific unique place), camera_angle (unique framing/angle), visual_description "
+        "(action only, no appearance), motion (one English sentence describing movement), narration, sound_effect. "
+        "Every scene must use a different location and a different camera_angle. "
         f"Write approximately {max(1, (min_words + max_words) // (2 * scene_count))} spoken words in each scene's narration; do not count other fields. "
-        "Write each visual_description in English as a self-contained illustration prompt that names the characters present, the place and the action. "
+        "Write each visual_description in English as an action-only description; the image prompt adds "
+        "the exact character appearance from the bible, plus location and camera angle. "
         f"Narration must be in {language_name}. {type_guidance}"
     )
     system = "You are a children's story creator. Write original, age-appropriate stories. Never imitate a copyrighted franchise. Return valid JSON."
@@ -395,16 +411,19 @@ async def write_story(
         narration = " ".join(str(scene.get("narration", "")) for scene in usable_scenes)
         word_count = len(re.findall(r"\S+", narration))
         counts.append(word_count)
-        if min_words <= word_count <= max_words:
+        validation_error = validate_story_scenes(usable_scenes, character_bible, scene_count)
+        if min_words <= word_count <= max_words and not validation_error:
             return story
         adjustment = "Expand" if word_count < min_words else "Shorten"
+        if validation_error:
+            adjustment = validation_error
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": content},
             {"role": "user", "content": (
-                f"The usable scene narration contained {word_count} words. {adjustment} the narration "
-                f"to {min_words}-{max_words} words total, aiming for about "
+                f"The usable scene narration contained {word_count} words. Correction required: "
+                f"{adjustment}. Ensure the narration is {min_words}-{max_words} words total, aiming for about "
                 f"{max(1, (min_words + max_words) // (2 * scene_count))} words in each of {scene_count} scenes. "
                 "Keep the same characters and story, and return the complete corrected JSON."
             )},
@@ -415,12 +434,48 @@ async def write_story(
     )
 
 
+def validate_story_scenes(scenes, character_bible, scene_count):
+    if len(scenes) != scene_count:
+        return f"Return exactly {scene_count} valid scenes."
+    by_id = {item["id"]: item for item in character_bible}
+    locations, angles = set(), set()
+    for index, scene in enumerate(scenes, 1):
+        ids = scene.get("character_ids")
+        if (
+            not isinstance(ids, list) or not ids
+            or any(not isinstance(item, str) or item not in by_id for item in ids)
+            or len(set(ids)) != len(ids)
+        ):
+            return f"Scene {index} must use one or more valid character-bible IDs."
+        narration = str(scene.get("narration", "")).casefold()
+        for character_id in ids:
+            if by_id[character_id]["name"].casefold() not in narration:
+                return f"Scene {index} narration must include the exact name {by_id[character_id]['name']}."
+        for field, unique in (("location", locations), ("camera_angle", angles)):
+            value = scene.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return f"Scene {index} needs a {field.replace('_', ' ')}."
+            normalized = " ".join(value.casefold().split())
+            if normalized in unique:
+                return f"Every scene needs a different {field.replace('_', ' ')}."
+            unique.add(normalized)
+        if not str(scene.get("visual_description", "")).strip():
+            return f"Scene {index} needs an action-only visual description."
+    return ""
+
+
 def character_sheet(story) -> str:
-    style = str(story.get("art_style") or "soft colorful 3D cartoon style").strip()
-    people = []
-    for item in story.get("characters") or []:
-        if isinstance(item, dict) and item.get("name") and item.get("appearance"):
-            people.append(f"{str(item['name']).strip()}: {str(item['appearance']).strip()}")
+    style = str(story.get("art_style") or "cute colorful 3D cartoon for toddlers").strip()
+    ids = list(dict.fromkeys(
+        character_id
+        for scene in (story.get("scenes") or story.get("sections") or [])
+        for character_id in scene.get("character_ids", [])
+    ))
+    library = {item["id"]: item for item in load_characters(character_library_path())}
+    people = [
+        f"{library[item]['name']} ({library[item]['gender']}): {library[item]['fixed_visual_description']}"
+        for item in ids if item in library
+    ]
     sheet = f"Art style: {style}."
     if people:
         sheet += " Recurring characters, drawn identically in every scene: " + "; ".join(people) + "."
@@ -436,58 +491,17 @@ def font(size, basic=False):
     return ImageFont.load_default()
 
 
-def make_frame(scene, path, index, total, language):
-    width, height = 720, 1280
-    image = Image.new("RGB", (width, height), (14, 35, 66))
-    draw = ImageDraw.Draw(image)
-    palette = [(14, 35, 66), (23, 72, 92), (58, 52, 86), (18, 74, 73), (78, 64, 37)]
-    base = palette[index % len(palette)]
-    for y in range(height):
-        ratio = y / height
-        draw.line((0, y, width, y), fill=tuple(int(base[k] * (1-ratio) + (7, 15, 33)[k] * ratio) for k in range(3)))
-    for x, y, radius in ((70, 130, 5), (620, 200, 7), (150, 300, 4), (590, 860, 5), (100, 1050, 6)):
-        draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=(200, 222, 243))
-    draw.rounded_rectangle((34, 280, width-34, 1000), radius=34, fill=(8, 17, 38), outline=(126, 108, 255), width=3)
-    draw.text((width//2, 345), "Kids Haven", font=font(34), fill=(207, 198, 255), anchor="mm")
-    narration = scene.get("narration", "")
-    lines, line = [], ""
-    for word in narration.split():
-        candidate = f"{line} {word}".strip()
-        if draw.textbbox((0, 0), candidate, font=font(32))[2] > width-110 and line:
-            lines.append(line)
-            line = word
-        else:
-            line = candidate
-    if line:
-        lines.append(line)
-    y = 470
-    for part in lines[:9]:
-        try:
-            draw.text((width//2, y), part, font=font(32), fill="white", anchor="mm", direction="rtl" if language == "ar" else "ltr")
-        except (TypeError, ValueError):
-            draw.text((width//2, y), part, font=font(32), fill="white", anchor="mm")
-        y += 54
-    draw.text((width//2, 940), f"{index+1} / {total}", font=font(24), fill=(205, 218, 237), anchor="mm")
-    image.save(path)
-
-
 def check_image_provider():
     if VIDEO_PROVIDER not in animation.VIDEO_PROVIDERS:
         raise RuntimeError(f"Unsupported VIDEO_PROVIDER: {VIDEO_PROVIDER!r}.")
-    if VIDEO_PROVIDER == "blender":
-        return
     if VIDEO_PROVIDER not in ("none",) and IMAGE_PROVIDER != "cloudflare":
         raise RuntimeError("Image-to-video providers require IMAGE_PROVIDER=cloudflare.")
     if VIDEO_PROVIDER in animation.FAL_PROVIDERS and not FAL_KEY:
         raise RuntimeError("This video provider requires FAL_KEY.")
     if VIDEO_PROVIDER == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
         raise RuntimeError("VIDEO_PROVIDER=runway requires RUNWAY_API_KEY.")
-    if IMAGE_PROVIDER not in ("cards", "cloudflare"):
-        raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
-    if IMAGE_PROVIDER == "cloudflare" and not (
-        re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
-    ):
-        raise RuntimeError("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN in Railway for Cloudflare images.")
+    if IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("Scene images must use the Cloudflare/Pollinations AI image pipeline.")
 
 
 def cloudflare_error(response):
@@ -520,63 +534,194 @@ def cloudflare_error(response):
     return f"Cloudflare image generation failed (HTTP {response.status_code}{detail})."
 
 
+async def make_cloudflare_frame(scene, path, size=(720, 1280), style=""):
+    description = scene.get("visual_description", "").strip()
+    if not description:
+        raise RuntimeError("A scene is missing its visual description for image generation.")
+    ids = scene.get("character_ids")
+    if not isinstance(ids, list) or not ids:
+        raise RuntimeError("Every scene must identify characters from the character bible.")
+    if not scene.get("location") or not scene.get("camera_angle"):
+        raise RuntimeError("Every scene needs its own location and camera angle.")
+    action = (
+        f"Location: {scene.get('location') or 'a colorful child-friendly setting'}. "
+        f"Camera angle: {scene.get('camera_angle') or 'eye-level wide shot'}. "
+        f"Action: {description}"
+    )
+    library_path = character_library_path()
+    prompt = build_image_prompt(
+        action, ids, path=library_path,
+        style=style or "Original colorful 3D cartoon illustration for young children, 9:16",
+    )
+    path = Path(path)
+
+    def validate_generated_file():
+        if not path.is_file() or path.stat().st_size < 10_000:
+            raise RuntimeError("The generated image file is under 10 KB.")
+        try:
+            with Image.open(path) as image:
+                deviation = ImageStat.Stat(image.convert("L")).stddev[0]
+        except (OSError, UnidentifiedImageError) as exc:
+            raise RuntimeError("The generated image is invalid.") from exc
+        if deviation < 2:
+            raise RuntimeError("The generated image is blank.")
+
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        await scene_images.generate_image(
+            prompt, get_seed(ids[0], path=library_path), path, size=size
+        )
+        validate_generated_file()
+        return
+
+    last_error = None
+    quota_error = False
+    for attempt in range(3):
+        try:
+            await _cloudflare_frame(prompt, path, size)
+            validate_generated_file()
+            return
+        except (RuntimeError, OSError, ValueError, Image.DecompressionBombError) as exc:
+            last_error = exc
+            path.unlink(missing_ok=True)
+            quota_error = quota_error or "HTTP 429" in str(exc) or "4006" in str(exc)
+            if attempt < 2:
+                await asyncio.sleep(3)
+
+    if quota_error:
+        try:
+            await make_hf_inference_frame(prompt[:900], path, size)
+            validate_generated_file()
+            return
+        except (RuntimeError, OSError, ValueError, Image.DecompressionBombError) as exc:
+            last_error = exc
+            path.unlink(missing_ok=True)
+
+    seed = get_seed(ids[0], path=library_path)
+    for attempt in range(3):
+        try:
+            image = await scene_images._pollinations_once(prompt, (seed + attempt) % 2**32, size)
+            await asyncio.to_thread(scene_images._save_image, image, path)
+            validate_generated_file()
+            return
+        except (RuntimeError, ValueError, OSError, Image.DecompressionBombError) as exc:
+            path.unlink(missing_ok=True)
+            pollinations_error = exc
+    raise RuntimeError(
+        f"Cloudflare/Hugging Face and configured image fallbacks failed "
+        f"({last_error}); Pollinations fallback failed: {pollinations_error}"
+    ) from pollinations_error
+
+
 async def make_hf_inference_frame(prompt, path, size):
-    """Fallback when the Cloudflare daily quota is exhausted: Hugging Face Inference (needs HF_TOKEN; free credits are limited)."""
+    """Use Hugging Face Inference as a fallback when Cloudflare's image quota is exhausted."""
     if not HF_TOKEN:
-        raise RuntimeError("Cloudflare image quota is exhausted. Wait for the daily reset (00:00 UTC) or set HF_TOKEN for a fallback.")
+        raise RuntimeError("Cloudflare image quota is exhausted and HF_TOKEN is not configured.")
     url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
     try:
         async with httpx.AsyncClient(timeout=180) as http:
-            response = await http.post(url, headers={"Authorization": f"Bearer {HF_TOKEN}"}, json={"inputs": prompt[:900], "parameters": {"width": 1024, "height": 576 if size[0] > size[1] else 1024}})
+            response = await http.post(
+                url,
+                headers={"Authorization": f"Bearer {HF_TOKEN}"},
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "width": 1024,
+                        "height": 576 if size[0] > size[1] else 1024,
+                    },
+                },
+            )
         response.raise_for_status()
         with Image.open(io.BytesIO(response.content)) as image:
             image = ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS)
     except (httpx.HTTPError, UnidentifiedImageError, OSError) as exc:
-        raise RuntimeError(f"Fallback image generation failed: {exc}") from exc
+        raise RuntimeError(f"Hugging Face image fallback failed: {exc}") from exc
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     image.save(path, format="PNG")
 
 
-async def make_cloudflare_frame(scene, path, size=(720, 1280), style=""):
-    try:
-        await _cloudflare_frame(scene, path, size, style)
-    except RuntimeError as exc:
-        if "HTTP 429" not in str(exc) and "4006" not in str(exc):
-            raise
-        print("Cloudflare quota exhausted; trying Hugging Face fallback.", flush=True)
-        prompt = ((style or "children's storybook illustration") + " " + str(scene.get("character_sheet", ""))[:500] + " Scene: " + str(scene.get("visual_description", "")))
-        await make_hf_inference_frame(prompt, path, size)
+async def _cloudflare_frame(prompt, path, size=(720, 1280)):
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        raise RuntimeError("Set CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN.")
+    body = {"prompt": prompt[:2048], "steps": 8}
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/"
+        "@cf/black-forest-labs/flux-1-schnell"
+    )
 
+    def rejects_steps(response):
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        messages = [
+            str(error.get("message", "")).lower()
+            for error in errors if isinstance(error, dict)
+        ]
+        codes = [
+            error.get("code") for error in errors
+            if isinstance(error, dict)
+        ]
+        rejection_terms = (
+            "unknown", "unexpected", "not allowed", "unsupported",
+            "unrecognized", "additional propert", "unevaluated propert",
+        )
+        return any(
+            "steps" in message and any(term in message for term in rejection_terms)
+            for message in messages
+        ) or any(
+            code == 5006 and any(
+                term in message for term in ("unevaluated propert", "additional propert")
+            )
+            for code, message in zip(codes, messages)
+        )
 
-async def _cloudflare_frame(scene, path, size=(720, 1280), style=""):
-    description = scene.get("visual_description", "").strip()
-    if not description:
-        raise RuntimeError("A scene is missing its visual description for image generation.")
-    prompt = (
-        (style or "Original child-friendly storybook illustration, bright colors, gentle and safe, ")
-        + " no text, no logos, no recognizable copyrighted characters. "
-        + str(scene.get("character_sheet", ""))[:800] + " Scene: " + description
-    )[:2048]
-    body = {"prompt": prompt}
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell"
     try:
         async with httpx.AsyncClient(timeout=120) as http:
-            response = await http.post(url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"}, json=body)
-        response.raise_for_status()
+            response = await http.post(
+                url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                json=body,
+            )
+            if "steps" in body and rejects_steps(response):
+                body = {"prompt": body["prompt"]}
+                response = await http.post(
+                    url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                    json=body,
+                )
+            response.raise_for_status()
+            payload = response.json()
+            if (
+                isinstance(payload, dict) and payload.get("success") is not True
+                and "steps" in body and rejects_steps(response)
+            ):
+                body = {"prompt": body["prompt"]}
+                response = await http.post(
+                    url, headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                    json=body,
+                )
+                response.raise_for_status()
+                payload = response.json()
     except httpx.HTTPStatusError as exc:
         raise RuntimeError(cloudflare_error(exc.response)) from exc
     except httpx.RequestError as exc:
         raise RuntimeError("Could not reach Cloudflare image generation; try again.") from exc
+
     try:
-        payload = response.json()
-        if payload.get("success") is not True:
+        if not isinstance(payload, dict) or payload.get("success") is not True:
             raise RuntimeError(cloudflare_error(response))
         image_bytes = base64.b64decode(payload["result"]["image"], validate=True)
-        if len(image_bytes) > 20 * 1024 * 1024:
-            raise RuntimeError("Cloudflare returned an image that is too large.")
-        with Image.open(io.BytesIO(image_bytes)) as image:
-            image = ImageOps.fit(image.convert("RGB"), size, method=Image.Resampling.LANCZOS)
-    except (ValueError, KeyError, TypeError, binascii.Error, UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        if not image_bytes or len(image_bytes) > 20 * 1024 * 1024:
+            raise ValueError("Cloudflare returned an empty or oversized image.")
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            image = ImageOps.fit(source.convert("RGB"), size, method=Image.Resampling.LANCZOS)
+    except (
+        ValueError, KeyError, TypeError, binascii.Error, UnidentifiedImageError,
+        OSError, Image.DecompressionBombError,
+    ) as exc:
         raise RuntimeError("Cloudflare returned an invalid image response.") from exc
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     try:
         image.save(temporary, format="PNG")
@@ -612,7 +757,7 @@ async def make_hf_motion(scene, image_path, path, size=(720, 1280)):
     """Free image-to-video through a public Hugging Face Space (slow, queued, may fail)."""
     from gradio_client import Client, handle_file
 
-    prompt = ("Smooth 3D animated children's cartoon, gentle character movement. " + str(scene.get("motion") or scene.get("visual_description") or ""))[:500]
+    prompt = ("Gentle children's cartoon movement, preserving the character design. " + str(scene.get("motion") or scene.get("visual_description") or ""))[:500]
 
     def run():
         client = Client(HF_SPACE, hf_token=HF_TOKEN or None)
@@ -673,9 +818,12 @@ def make_caption_images(narration, language, duration, folder, index):
         lines.append(line)
         image = Image.new("RGBA", (720, 390), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((20, 0, 700, 70 * len(lines) + 39), radius=28, fill=(0, 0, 0, 150))
         for row, text in enumerate(lines):
-            draw.text((360, 20 + 70 * row + 35), shape_text(text, language), font=caption_font, fill=(255, 255, 255, 255), anchor="mm")
+            draw.text(
+                (360, 20 + 70 * row + 35), shape_text(text, language),
+                font=caption_font, fill=(255, 255, 255, 255), anchor="mm",
+                stroke_width=5, stroke_fill=(0, 0, 0, 255),
+            )
         path = folder / f"caption-{index}-{number}.png"
         image.save(path)
         captions.append((path, cursor, cursor + span))
@@ -765,26 +913,18 @@ def animated_video_filter(index, sparkle_input, caption_input=None, captions=(),
 
 
 async def prepare_scene(scene, index, total, language, voice, job_dir):
-    frame = job_dir / (f"artwork-{index}.png" if IMAGE_PROVIDER == "cloudflare" else f"scene-{index}.png")
+    frame = job_dir / f"artwork-v2-{index}.png"
     audio = job_dir / f"voice-{index}.mp3"
-    motion = job_dir / f"motion-{index}.mp4"
+    motion = job_dir / f"motion-v2-{index}.mp4"
 
     async def prepare_image():
         if not frame.exists():
-            if IMAGE_PROVIDER == "cloudflare":
-                await make_cloudflare_frame(scene, frame)
-            else:
-                await asyncio.to_thread(make_frame, scene, frame, index, total, language)
-        if IMAGE_PROVIDER == "cloudflare":
-            if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
-                if not motion.exists():
-                    await make_fal_motion(scene, frame, motion)
-            elif VIDEO_PROVIDER == "hf" and not motion.exists():
-                try:
-                    await make_hf_motion(scene, frame, motion)
-                except Exception as exc:
-                    # Free Spaces are unreliable: fall back to the zoom animation for this scene.
-                    print(f"HF motion failed for scene {index+1}, using zoom: {exc}", flush=True)
+            await make_cloudflare_frame(scene, frame)
+        if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
+            if not motion.is_file():
+                await make_fal_motion(scene, frame, motion)
+        elif VIDEO_PROVIDER == "hf" and not motion.is_file():
+            await make_hf_motion(scene, frame, motion)
 
     async def prepare_voice():
         if audio.is_file() and audio.stat().st_size:
@@ -828,38 +968,14 @@ async def pipeline_scenes(scenes, prepare, render):
     return clips
 
 
-blender_lock = asyncio.Lock()
-
-
-async def blender_animation(variant=0):
-    output = DATA_DIR / f"blender-child-v4-{variant}.mp4"
-    async with blender_lock:
-        if output.is_file() and output.stat().st_size:
-            return output
-        with tempfile.TemporaryDirectory(prefix="blender-", dir=WORK_DIR) as directory:
-            folder = Path(directory)
-            commands = [
-                ["blender", "-b", "--threads", "2", "--python-exit-code", "1", "--python", str(ROOT / "blender_character.py"), "--", str(folder), str(variant)],
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", "12", "-i", str(folder / "frame-%04d.png"),
-                 "-c:v", "libx264", "-threads", "2", "-pix_fmt", "yuv420p", str(folder / "animation.mp4")],
-            ]
-            for command in commands:
-                try:
-                    result = await asyncio.to_thread(subprocess.run, command, capture_output=True, text=True, timeout=600)
-                except FileNotFoundError as exc:
-                    raise RuntimeError(f"{command[0]} is not installed.") from exc
-                if result.returncode:
-                    raise RuntimeError(f"{command[0]} failed (exit {result.returncode}): {result.stderr[-500:]}")
-            clip = folder / "animation.mp4"
-            if not clip.is_file() or not clip.stat().st_size:
-                raise RuntimeError("Blender animation was not created.")
-            clip.replace(output)
-    return output
-
-
 async def render_song_episode(episode, scenes, meta, job_dir, control=None):
-    if IMAGE_PROVIDER != "cloudflare" and VIDEO_PROVIDER != "blender":
-        raise RuntimeError("Song videos need IMAGE_PROVIDER=cloudflare (3D scene images).")
+    if IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("Song videos need AI-generated scene images.")
+    validation_error = validate_story_scenes(
+        scenes, load_characters(character_library_path()), len(scenes)
+    )
+    if validation_error:
+        raise RuntimeError(f"Saved song scene is incompatible with the character bible: {validation_error}")
     episode_id, language = episode["id"], episode["language"]
 
     def progress(value):
@@ -879,25 +995,19 @@ async def render_song_episode(episode, scenes, meta, job_dir, control=None):
     async def image(scene, path):
         await make_cloudflare_frame(scene, path, song_studio.SIZE, song_studio.STYLE_3D + ".")
 
-    motion = None
-    prebuilt_motion = None
     if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
-        motion = lambda scene, frame, path: make_fal_motion(scene, frame, path, song_studio.SIZE)
+        motion = lambda scene, frame, path, duration: make_fal_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "hf":
-        motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
-    elif VIDEO_PROVIDER == "blender":
-        actions = song_studio.blender_action_indices(scenes)
-        loops = {}
-        selected = sorted(set(actions))
-        for position, index in enumerate(selected):
-            loops[index] = await blender_animation(index)
-            progress(8 + (position + 1) * 10 // len(selected))
-        prebuilt_motion = [loops[index] for index in actions]
+        motion = lambda scene, frame, path, duration: make_hf_motion(scene, frame, path, song_studio.SIZE)
+    else:
+        motion = lambda scene, frame, path, duration: scene_video.make_parallax_clip(
+            frame, path, duration, size=song_studio.SIZE, work_dir=job_dir
+        )
     output = MEDIA_DIR / f"{episode_id}.mp4"
     await song_studio.render_song_video(
         scenes, timings, song_file, language, job_dir, output, image, motion,
         lambda size: font(size, basic=True), shape_text, progress,
-        prebuilt_motion=prebuilt_motion, control=control,
+        control=control,
     )
     create_video_thumbnail(output, episode.get("title", "Kids Haven"), language, MEDIA_DIR / f"{episode_id}-thumbnail.jpg")
     with db() as con:
@@ -964,6 +1074,13 @@ async def render_video(episode_id: str):
     episode = dict(row)
     episode_meta = json.loads(episode["meta"]) if episode.get("meta") else {}
     scenes = json.loads(episode["scenes"])
+    if not isinstance(scenes, list) or not scenes:
+        raise RuntimeError("Episode has no renderable scene list.")
+    validation_error = validate_story_scenes(
+        scenes, load_characters(character_library_path()), len(scenes)
+    )
+    if validation_error:
+        raise RuntimeError(f"Saved episode scene is incompatible with the character bible: {validation_error}")
     check_image_provider()
     if not subprocess.run(["ffmpeg", "-version"], capture_output=True).returncode == 0:
         raise RuntimeError("FFmpeg is missing")
@@ -976,8 +1093,6 @@ async def render_video(episode_id: str):
             await wait_for_production_job(episode_id)
     if episode_meta.get("kind") == "song":
         return await render_song_episode(episode, scenes, episode_meta, job_dir, control=control)
-    if VIDEO_PROVIDER == "blender":
-        raise RuntimeError("VIDEO_PROVIDER=blender currently supports song episodes only; use CONTENT_MODE=song.")
     voice = episode_meta.get("voice") or (VOICE_AR if episode["language"] == "ar" else VOICE_EN)
     music = Path(BACKGROUND_MUSIC_PATH) if BACKGROUND_MUSIC_PATH else None
     if music and not music.is_file():
@@ -997,11 +1112,15 @@ async def render_video(episode_id: str):
         temporary_clip = job_dir / f"clip-{index}.tmp.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        use_motion = VIDEO_PROVIDER in (*animation.FAL_PROVIDERS, "runway", "hf") and (job_dir / f"motion-{index}.mp4").exists()
-        if use_motion:
-            command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(job_dir / f"motion-{index}.mp4"), "-i", str(audio)]
-        else:
-            command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-loop", "1", "-framerate", "24", "-i", str(frame), "-i", str(audio)]
+        motion_path = job_dir / f"motion-v2-{index}.mp4"
+        use_motion = VIDEO_PROVIDER in (*animation.FAL_PROVIDERS, "runway", "hf")
+        if not use_motion:
+            await scene_video.make_parallax_clip(
+                frame, motion_path, audio_duration(audio), size=(720, 1280), work_dir=job_dir
+            )
+        if not motion_path.is_file() or motion_path.stat().st_size == 0:
+            raise RuntimeError(f"No animated clip was produced for scene {index + 1}.")
+        command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(motion_path), "-i", str(audio)]
         if music:
             command += ["-stream_loop", "-1", "-i", str(music)]
         if IMAGE_PROVIDER == "cloudflare":
@@ -1014,13 +1133,7 @@ async def render_video(episode_id: str):
             playlist = job_dir / f"captions-{index}.txt"
             write_caption_playlist(captions, playlist)
             command += ["-f", "concat", "-safe", "1", "-i", str(playlist)]
-            if use_motion:
-                filters = [animated_video_filter(index, sparkle_input, 4, captions, motion=True)]
-            else:
-                filters = [animated_video_filter(index, sparkle_input, 4, captions)]
-            video_map = "[vout]"
-        else:
-            filters = ["[0:v]scale=720:1280,format=yuv420p[vout]"]
+            filters = [animated_video_filter(index, sparkle_input, 4, captions, motion=True)]
             video_map = "[vout]"
         if music:
             filters.append("[2:a]volume=0.12[bg];[1:a][bg]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]")
@@ -1039,6 +1152,9 @@ async def render_video(episode_id: str):
         return clip
 
     clips = await pipeline_scenes(scenes, prepare, render)
+    scene_images.ensure_distinct_images([
+        job_dir / f"artwork-v2-{index}.png" for index in range(len(scenes))
+    ])
     concat = job_dir / "concat.txt"
     concat.write_text("".join(f"file '{clip.as_posix()}'\n" for clip in clips), encoding="utf-8")
     output = MEDIA_DIR / f"{episode_id}.mp4"
@@ -1094,13 +1210,8 @@ async def create_daily_episode(language: str, run_date: date):
             if CONTENT_MODE == "song":
                 topic = song_studio.SONG_TOPICS[(run_date.toordinal() + (1 if language == "en" else 0)) % len(song_studio.SONG_TOPICS)] if not DAILY_TOPIC else DAILY_TOPIC
                 try:
-                    character_instruction = (
-                        "The main character is an original young child in a garden, not an animal. "
-                        "Write lyrics suitable for the limited animations described below, without claiming that unavailable objects appear."
-                        if VIDEO_PROVIDER == "blender" else ""
-                    )
                     story = await asyncio.wait_for(
-                        song_studio.write_song(client, model, topic, language, recent_titles(), character_instruction=character_instruction),
+                        song_studio.write_song(client, model, topic, language, recent_titles()),
                         timeout=300,
                     )
                 except asyncio.TimeoutError as exc:
@@ -1119,7 +1230,16 @@ async def create_daily_episode(language: str, run_date: date):
                 raw_scenes = story.get("scenes")
                 if not isinstance(raw_scenes, list):
                     raise RuntimeError("The AI did not return scenes")
-                scenes = [{"visual_description": str(scene.get("visual_description", "A friendly sea adventure")), "narration": str(scene.get("narration", "")).strip(), "sound_effect": str(scene.get("sound_effect", "gentle ocean waves")), "motion": str(scene.get("motion", "")).strip(), "character_sheet": sheet} for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()][:8]
+                scenes = [{
+                    "visual_description": str(scene["visual_description"]).strip(),
+                    "location": str(scene["location"]).strip(),
+                    "camera_angle": str(scene["camera_angle"]).strip(),
+                    "character_ids": list(scene["character_ids"]),
+                    "narration": str(scene.get("narration", "")).strip(),
+                    "sound_effect": str(scene.get("sound_effect", "gentle ambience")),
+                    "motion": str(scene.get("motion", "")).strip(),
+                    "character_sheet": sheet,
+                } for scene in raw_scenes if isinstance(scene, dict) and str(scene.get("narration", "")).strip()]
             if not scenes:
                 raise RuntimeError("The AI returned empty narration")
             episode_id = str(uuid.uuid4())
@@ -1431,15 +1551,18 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def settings_keyboard():
+    video_options = [
+        ("بدون تحريك", "none"), ("Kling عبر fal.ai", "kling"), ("Hailuo عبر fal.ai", "hailuo"),
+        ("PixVerse عبر fal.ai", "pixverse"), ("Vidu عبر fal.ai", "vidu"),
+        ("Seedance عبر fal.ai", "dreamina"), ("Runway API", "runway"),
+        ("Google Veo عبر fal.ai", "veo"), ("fal.ai مخصص", "fal"),
+        ("Hugging Face", "hf"),
+    ]
     options = [
         ("نوع المحتوى", "content_mode", [("قصص", "story"), ("أغاني", "song")]),
-        ("الصور", "image_provider", [("بطاقات", "cards"), ("Cloudflare AI", "cloudflare")]),
+        ("الصور", "image_provider", [("Cloudflare AI + Pollinations fallback", "cloudflare")]),
         ("الفيديو", "video_provider", [
-            ("بدون تحريك", "none"), ("Kling عبر fal.ai", "kling"), ("Hailuo عبر fal.ai", "hailuo"),
-            ("PixVerse عبر fal.ai", "pixverse"), ("Vidu عبر fal.ai", "vidu"),
-            ("Seedance عبر fal.ai", "dreamina"), ("Runway API", "runway"),
-            ("Google Veo عبر fal.ai", "veo"), ("fal.ai مخصص", "fal"),
-            ("Hugging Face", "hf"), ("Blender", "blender"),
+            option for option in video_options if option[1] != "blender"
         ]),
         ("الموسيقى", "song_provider", [("TTS وإيقاع", "tts"), ("غناء fal.ai", "fal")]),
     ]
@@ -1460,7 +1583,7 @@ async def tg_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح.")
         return
     await update.message.reply_text(
-        f"الإعدادات الفعّالة حالياً:\nالمحتوى: {CONTENT_MODE}\nالصور: {IMAGE_PROVIDER}\nالفيديو: {VIDEO_PROVIDER}\nالموسيقى: {SONG_PROVIDER}\n\nالخدمات التي تحتاج مفاتيح لن تعمل قبل ضبطها في Railway.",
+        f"الإعدادات الفعّالة حالياً:\nالمحتوى: {CONTENT_MODE}\nالصور: Cloudflare AI مع Pollinations كبديل تلقائي\nالفيديو: {VIDEO_PROVIDER}\nالموسيقى: {SONG_PROVIDER}\n\nأضف مفاتيح الخدمات المدفوعة إلى Railway قبل اختيارها.",
         reply_markup=settings_keyboard(),
     )
 
@@ -1535,6 +1658,9 @@ async def create_idea_draft(flow):
         raise RuntimeError("النموذج لم يُرجع مشاهد للسيناريو.")
     scenes = [{
         "visual_description": str(scene.get("visual_description", "")).strip(),
+        "location": str(scene.get("location", "")).strip(),
+        "camera_angle": str(scene.get("camera_angle", "")).strip(),
+        "character_ids": list(scene.get("character_ids") or []),
         "narration": str(scene.get("narration", "")).strip(),
         "sound_effect": str(scene.get("sound_effect", "gentle ambience")).strip(),
         "motion": str(scene.get("motion", "")).strip(),
@@ -1697,9 +1823,6 @@ async def produce_idea_episode(episode_id, report):
     if row["status"] not in ("draft", "failed") and not retrying_stale and not paused_retry:
         await report("هذه المسودة غير موجودة أو سبق بدء إنتاجها.")
         return
-    if VIDEO_PROVIDER == "blender":
-        await report("وضع Blender الحالي يدعم حلقات الأغاني الجاهزة فقط، وليس تمثيل القصص. غيّر VIDEO_PROVIDER إلى none أو fal أو hf قبل بدء إنتاج هذه المسودة.")
-        return
     timestamp = utc_now().isoformat()
     settings_json = json.dumps({
         "image_provider": IMAGE_PROVIDER,
@@ -1748,6 +1871,10 @@ async def process_production_job(episode_id):
         try:
             if job["settings_json"]:
                 settings = json.loads(job["settings_json"])
+                if settings.get("image_provider") == "cards":
+                    settings["image_provider"] = "cloudflare"
+                if settings.get("video_provider") == "blender":
+                    settings["video_provider"] = "none"
                 validate_studio_settings(settings)
                 IMAGE_PROVIDER = settings["image_provider"]
                 VIDEO_PROVIDER = settings["video_provider"]
@@ -2203,6 +2330,7 @@ async def web_status(x_api_key: Optional[str] = Header(default=None)):
             "admin_id": bool(ADMIN_TELEGRAM_ID),
             "youtube_connected": bool(load_google_credentials()),
             "cloudflare": bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN),
+            "pollinations_fallback": True,
             "scheduler_running": bool(scheduler_task and not scheduler_task.done()),
             "production_worker_running": bool(production_worker_task and not production_worker_task.done()),
         },
@@ -2243,13 +2371,13 @@ function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(
 async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
 async function post(p,body){const r=await fetch(p,{method:'POST',headers:{'x-api-key':sessionStorage.getItem('k')||'','Content-Type':'application/json'},body:JSON.stringify(body||{})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);return j}
 function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
-const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['kling','Kling via fal.ai'],['hailuo','Hailuo via fal.ai'],['pixverse','PixVerse via fal.ai'],['vidu','Vidu via fal.ai'],['dreamina','Seedance via fal.ai'],['runway','Runway API'],['veo','Google Veo via fal.ai'],['fal','fal.ai custom'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
+const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cloudflare','Cloudflare AI + Pollinations']],video_provider:[['none','2.5D Parallax'],['kling','Kling via fal.ai'],['hailuo','Hailuo via fal.ai'],['pixverse','PixVerse via fal.ai'],['vidu','Vidu via fal.ai'],['dreamina','Seedance via fal.ai'],['runway','Runway API'],['veo','Google Veo via fal.ai'],['fal','fal.ai custom'],['hf','Hugging Face']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
 function drawProviders(settings){const c=$('providerControls');c.replaceChildren();for(const [key,label] of [['content_mode','نوع المحتوى'],['image_provider','الصور'],['video_provider','الفيديو'],['song_provider','الموسيقى']]){const wrap=document.createElement('label');wrap.append(el('div',label));const s=document.createElement('select');s.dataset.setting=key;for(const [value,name] of providerOptions[key]){const o=document.createElement('option');o.value=value;o.textContent=name;s.append(o)}s.value=settings[key];wrap.append(s);c.append(wrap)}}
 async function saveProviders(){const payload={};document.querySelectorAll('[data-setting]').forEach(x=>payload[x.dataset.setting]=x.value);try{const r=await post('/studio/settings',payload);$('providerMsg').textContent='تم الحفظ';drawProviders(r.settings);load()}catch(e){$('providerMsg').textContent=e.message}}
 async function jobAction(id,action){try{await post('/studio/queue/'+encodeURIComponent(id)+'/'+action,{});load()}catch(e){$('genmsg').textContent=e.message}}
 async function saveCost(id,input){try{await post('/studio/queue/'+encodeURIComponent(id)+'/cost',{cost_usd:input.value});load()}catch(e){$('genmsg').textContent=e.message}}
 async function load(){try{const [s,e,q]=await Promise.all([api('/studio/status'),api('/studio/episodes'),api('/studio/queue')]);$('login').hidden=true;$('main').hidden=false;$('gen').disabled=s.generating;if(!document.querySelector('[data-setting]:focus'))drawProviders(s.settings);
-const L={fastllm:'نموذج النص',telegram:'Telegram',admin_id:'معرّف الأدمن',youtube_connected:'YouTube',cloudflare:'Cloudflare',scheduler_running:'الجدولة'};
+const L={fastllm:'نموذج النص',telegram:'Telegram',admin_id:'معرّف الأدمن',youtube_connected:'YouTube',cloudflare:'Cloudflare (اختياري)',pollinations_fallback:'Pollinations fallback',scheduler_running:'الجدولة'};
 $('settings').replaceChildren(...Object.entries(L).map(([k,n])=>el('div',(s.settings[k]?'✅ ':'❌ ')+n,s.settings[k]?'ok':'bad')),el('div','الصور: '+s.settings.image_provider),el('div','عربي '+s.settings.daily_ar_time+' / EN '+s.settings.daily_en_time+' UTC'));
 $('counts').replaceChildren(...Object.entries(s.counts).map(([k,v])=>el('div',k+': '+v)));
 rows($('queue'),['المهمة','الحالة','التقدم','التكلفة USD','تحكم'],q.jobs.map(j=>{const controls=document.createElement('span');for(const [a,n] of (j.status==='running'?[['pause','إيقاف مؤقت'],['stop','إلغاء']]:j.status==='paused'?[['resume','استكمال'],['stop','إلغاء']]:j.status==='failed'?[['resume','إعادة محاولة']]:j.status==='queued'?[['stop','إلغاء']]:[])){const b=document.createElement('button');b.textContent=n;b.onclick=()=>jobAction(j.episode_id,a);controls.append(b)}const cost=document.createElement('span');const input=document.createElement('input');input.type='number';input.min='0';input.step='0.01';input.placeholder='سجّل الفاتورة';input.value=j.cost_usd??'';const save=document.createElement('button');save.textContent='حفظ';save.onclick=()=>saveCost(j.episode_id,input);cost.append(input,save);return[j.title+' · '+j.episode_id,j.status+' · محاولات '+j.attempts,j.render_progress+'%',cost,controls]}));

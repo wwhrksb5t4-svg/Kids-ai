@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 class Character(TypedDict):
     id: str
     name: str
+    gender: str
     species: str
     age_role: str
     fixed_visual_description: str
@@ -30,7 +31,7 @@ class Character(TypedDict):
 
 async_text_generator = Callable[[str], Awaitable[str]]
 _TEXT_FIELDS = (
-    "id", "name", "species", "age_role", "fixed_visual_description",
+    "id", "name", "gender", "species", "age_role", "fixed_visual_description",
     "personality", "voice", "rate", "pitch",
 )
 
@@ -47,11 +48,19 @@ def load_characters(path: Path = DEFAULT_LIBRARY) -> list[Character]:
 
     characters: list[Character] = []
     seen_ids: set[str] = set()
+    legacy_genders = {
+        character["id"]: character["gender"]
+        for character in json.loads(DEFAULT_LIBRARY.read_text(encoding="utf-8"))
+    }
     for item in data:
         if not isinstance(item, dict):
             raise ValueError("Each character must be a JSON object.")
+        if not item.get("gender") and item.get("id") in legacy_genders:
+            item["gender"] = legacy_genders[item["id"]]
         if any(not isinstance(item.get(key), str) or not item[key].strip() for key in _TEXT_FIELDS):
             raise ValueError("A character has a missing or invalid text field.")
+        if item["gender"] not in ("female", "male"):
+            raise ValueError(f"Invalid gender for character {item['id']}.")
         if item["id"] != item["id"].strip() or item["id"] in seen_ids:
             raise ValueError("Character IDs must be unique and have no surrounding whitespace.")
         if type(item.get("seed")) is not int or not 0 <= item["seed"] <= 2**32 - 1:
@@ -82,7 +91,7 @@ async def pick_characters_for_topic(
         raise ValueError("Character count must be between 1 and the library size.")
 
     choices = [
-        {key: character[key] for key in ("id", "name", "species", "personality")}
+        {key: character[key] for key in ("id", "name", "gender", "species", "personality")}
         for character in characters
     ]
     prompt = (
@@ -114,6 +123,7 @@ def build_image_prompt(
     character_ids: list[str],
     *,
     path: Path = DEFAULT_LIBRARY,
+    style: str = STYLE,
 ) -> str:
     if not isinstance(scene_action, str) or not scene_action.strip():
         raise ValueError("Scene action must not be empty.")
@@ -124,10 +134,14 @@ def build_image_prompt(
     if unknown:
         raise ValueError(f"Unknown character ID: {unknown[0]}")
     descriptions = "\n".join(
-        f"{characters[character_id]['name']}: {characters[character_id]['fixed_visual_description']}"
+        f"{characters[character_id]['name']} ({characters[character_id]['gender']}): "
+        f"{characters[character_id]['fixed_visual_description']}"
         for character_id in character_ids
     )
-    return f"{STYLE}.\nCharacters:\n{descriptions}\nScene action: {scene_action.strip()}"
+    return (
+        f"{style.strip()}.\nCharacters (copy each description verbatim):\n{descriptions}\n"
+        f"Scene: {scene_action.strip()}\nNegative prompt: {NEGATIVE_PROMPT}"
+    )
 
 
 def get_seed(character_id: str, *, path: Path = DEFAULT_LIBRARY) -> int:
