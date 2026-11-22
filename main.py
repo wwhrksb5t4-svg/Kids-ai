@@ -24,6 +24,7 @@ import edge_tts
 import httpx
 import song_studio
 from bidi.algorithm import get_display
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -36,6 +37,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+load_dotenv()
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data"))).resolve()
 MEDIA_DIR = DATA_DIR / "media"
@@ -48,12 +50,22 @@ TOKEN_PATH = DATA_DIR / "google-token.json"
 FASTLLM_API_KEY = (os.getenv("FASTLLM_API_KEY") or "").strip()
 FASTLLM_BASE_URL = (os.getenv("FASTLLM_BASE_URL") or "https://fastllm.top/v1").strip().rstrip("/")
 FASTLLM_MODEL = (os.getenv("FASTLLM_MODEL") or "auto").strip()
-TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 ADMIN_TELEGRAM_ID = (os.getenv("ADMIN_TELEGRAM_ID") or "").strip()
+ADMIN_IDS = tuple(part.strip() for part in (os.getenv("ADMIN_IDS") or "").split(",") if part.strip())
+if any(not value.isdigit() for value in ADMIN_IDS):
+    raise ValueError("ADMIN_IDS must be comma-separated numeric Telegram user IDs.")
+if not ADMIN_TELEGRAM_ID and ADMIN_IDS:
+    ADMIN_TELEGRAM_ID = ADMIN_IDS[0]
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
+MAX_UPLOADS_PER_DAY = int(os.getenv("MAX_UPLOADS_PER_DAY") or "1")
+if MAX_UPLOADS_PER_DAY < 1:
+    raise ValueError("MAX_UPLOADS_PER_DAY must be positive.")
 APP_API_KEY = (os.getenv("APP_API_KEY") or "").strip()
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or "").strip()
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or "").strip()
+YOUTUBE_CLIENT_SECRET = (os.getenv("YOUTUBE_CLIENT_SECRET") or "").strip()
 GOOGLE_REDIRECT_URI = (os.getenv("GOOGLE_REDIRECT_URI") or (PUBLIC_BASE_URL + "/youtube/oauth/callback" if PUBLIC_BASE_URL else "")).strip()
 DAILY_AR_TIME = (os.getenv("DAILY_AR_TIME") or "12:00").strip()
 DAILY_EN_TIME = (os.getenv("DAILY_EN_TIME") or "14:00").strip()
@@ -90,6 +102,7 @@ client = AsyncOpenAI(api_key=FASTLLM_API_KEY, base_url=FASTLLM_BASE_URL) if FAST
 telegram_app: Optional[Application] = None
 scheduler_task: Optional[asyncio.Task] = None
 production_worker_task: Optional[asyncio.Task] = None
+auto_studio = None
 
 
 def utc_now():
@@ -224,7 +237,7 @@ def set_studio_settings(changes):
 
 def admin_only(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and ADMIN_TELEGRAM_ID and str(user.id) == ADMIN_TELEGRAM_ID)
+    return bool(user and str(user.id) in set(ADMIN_IDS + ((ADMIN_TELEGRAM_ID,) if ADMIN_TELEGRAM_ID else ())))
 
 
 def check_admin_id(value: Optional[str]):
@@ -235,6 +248,16 @@ def check_admin_id(value: Optional[str]):
 
 
 def google_client_config():
+    if YOUTUBE_CLIENT_SECRET:
+        try:
+            config = json.loads(Path(YOUTUBE_CLIENT_SECRET).read_text(encoding="utf-8"))
+            web = config["web"]
+            if not web["client_id"] or not web["client_secret"] or not GOOGLE_REDIRECT_URI:
+                raise ValueError("Missing web OAuth client credentials or redirect URI.")
+            web["redirect_uris"] = [GOOGLE_REDIRECT_URI]
+            return {"web": web}
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError("YOUTUBE_CLIENT_SECRET must point to a valid Google web OAuth client JSON file.") from exc
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not GOOGLE_REDIRECT_URI:
         raise RuntimeError("Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and PUBLIC_BASE_URL in Railway.")
     return {"web": {"client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": "https://oauth2.googleapis.com/token", "redirect_uris": [GOOGLE_REDIRECT_URI]}}
@@ -1220,6 +1243,22 @@ async def tg_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.message.reply_text("استخدم /resume متبوعاً بمعرّف مهمة متوقفة أو فاشلة.")
         return
+    if auto_studio:
+        message = None
+        with auto_studio.db() as con:
+            job = con.execute("SELECT status FROM auto_jobs WHERE id=?", (context.args[0],)).fetchone()
+            if job:
+                upload = con.execute("SELECT state FROM auto_uploads WHERE job_id=?", (context.args[0],)).fetchone()
+                if job["status"] != "failed":
+                    message = "المهمة التلقائية ليست فاشلة."
+                elif upload and upload["state"] not in ("pending", "complete"):
+                    message = "حالة النشر غير مؤكدة؛ تحقق من Telegram وYouTube قبل إعادة المحاولة لتجنب التكرار."
+                else:
+                    con.execute("UPDATE auto_jobs SET status='queued',error=NULL WHERE id=?", (context.args[0],))
+                    message = "تمت إعادة المهمة التلقائية إلى الطابور."
+        if message:
+            await update.message.reply_text(message)
+            return
     await produce_idea_episode(context.args[0], update.message.reply_text)
 
 
@@ -1300,9 +1339,6 @@ async def tg_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "FROM production_jobs j JOIN episodes e ON e.id=j.episode_id "
             "ORDER BY j.created_at DESC LIMIT 15"
         ).fetchall()
-    if not rows:
-        await update.message.reply_text("طابور الإنتاج فارغ.")
-        return
     labels = {
         "queued": "بالانتظار", "running": "قيد الإنتاج", "paused": "متوقفة",
         "completed": "جاهزة للمراجعة", "failed": "فشلت", "cancelled": "ملغاة",
@@ -1321,6 +1357,15 @@ async def tg_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             line += f"\nلتسجيل تكلفة الفاتورة: /cost {row['episode_id']} USD"
         lines.append(line)
+    if auto_studio:
+        with auto_studio.db() as con:
+            automatic = con.execute(
+                "SELECT id,topic,status FROM auto_jobs WHERE status IN ('pending','queued','running') ORDER BY created_at LIMIT 15"
+            ).fetchall()
+        lines.extend(f"موضوع آلي · {row['status']} · {row['topic']}\n{row['id']}" for row in automatic)
+    if not lines:
+        await update.message.reply_text("طابور الإنتاج فارغ.")
+        return
     await update.message.reply_text("\n\n".join(lines)[:3900])
 
 
@@ -1400,7 +1445,7 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
     await update.message.reply_text(
-        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو من فكرتك\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/status — حالة الخدمة\n/stats — إحصاءات YouTube\n\nكل فيديو يحتاج موافقتك قبل النشر العام.",
+        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو بمراجعة قبل النشر\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/create TOPIC — إنتاج ونشر تلقائي\n/auto_on HOURS — تفعيل الجدولة التلقائية\n/auto_off — إيقاف الجدولة\n/queue — الطابور\n/status — الحالة\n/stats — إحصاءات YouTube\n\nمسار /new و/today يحتاج موافقتك للنشر؛ /create و/auto_on ينشران تلقائياً.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✨ إنشاء فيديو من فكرة", callback_data="idea:new")],
             [InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")],
@@ -1818,6 +1863,21 @@ async def tg_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 line += f"\nالخطأ: {run['error'][:250]}"
             run_lines.append(line)
         lines = run_lines + (["\nآخر الحلقات:"] + lines if lines else [])
+    if auto_studio:
+        with auto_studio.db() as con:
+            last = con.execute("SELECT * FROM auto_jobs ORDER BY created_at DESC LIMIT 1").fetchone()
+            count = con.execute(
+                "SELECT COUNT(*) FROM auto_uploads WHERE upload_day=?", (utc_now().date().isoformat(),)
+            ).fetchone()[0]
+            queued = con.execute("SELECT COUNT(*) FROM auto_jobs WHERE status IN ('pending','queued','running')").fetchone()[0]
+        lines.append(
+            f"\nالإنتاج التلقائي: {'مفعّل' if auto_studio.setting('auto_enabled', '0') == '1' else 'متوقف'}"
+            f" · المواضيع المنتظرة/الجارية {queued} · رفع اليوم {count}/{MAX_UPLOADS_PER_DAY}"
+        )
+        if last:
+            lines.append(f"آخر مهمة: {last['topic']} · {last['status']}"
+                         + (f"\nالخطأ: {last['error'][:250]}" if last["error"] else "")
+                         + (f"\n{last['youtube_url']}" if last["youtube_url"] else ""))
     await update.message.reply_text("\n".join(lines) if lines else "لا توجد حلقات بعد.")
 
 
@@ -1933,9 +1993,10 @@ async def scheduler_loop():
                         done = con.execute("SELECT status FROM daily_runs WHERE run_date=? AND language=?", (now.date().isoformat(), language)).fetchone()
                     if not done or done["status"] == "failed":
                         try:
-                            row = await create_daily_episode(language, now.date())
-                            if row.get("status") in ("pending_review", "ready_for_review"):
-                                await send_episode_for_review(row["id"])
+                            async with generation_lock:
+                                row = await create_daily_episode(language, now.date())
+                                if row.get("status") in ("pending_review", "ready_for_review"):
+                                    await send_episode_for_review(row["id"])
                         except Exception as exc:
                             if telegram_app and ADMIN_TELEGRAM_ID:
                                 await telegram_app.bot.send_message(chat_id=int(ADMIN_TELEGRAM_ID), text=f"فشل الإنتاج الآلي ({language}): {str(exc)[:700]}")
@@ -1952,6 +2013,7 @@ def register_telegram_handlers(application):
     application.add_handler(CommandHandler("new", tg_new))
     application.add_handler(CommandHandler("cancel", tg_cancel))
     application.add_handler(CommandHandler("queue", tg_queue))
+    application.add_handler(CommandHandler("cost", tg_cost))
     application.add_handler(CommandHandler("pause", tg_pause))
     application.add_handler(CommandHandler("stop", tg_stop))
     application.add_handler(CommandHandler("connect", tg_connect))
@@ -1968,16 +2030,30 @@ def register_telegram_handlers(application):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_app, scheduler_task, production_worker_task
+    global telegram_app, scheduler_task, production_worker_task, auto_studio
     if TELEGRAM_BOT_TOKEN:
+        from pipeline.bot_commands import register_auto_handlers
+        from pipeline.scheduler import AutoStudio
+
         telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         register_telegram_handlers(telegram_app)
+        admins = sorted({int(item) for item in ADMIN_IDS + ((ADMIN_TELEGRAM_ID,) if ADMIN_TELEGRAM_ID else ())})
+        auto_studio = AutoStudio(
+            db_path=DB_PATH, data_dir=DATA_DIR, bot=telegram_app.bot, admin_ids=admins,
+            channel_id=CHANNEL_ID, max_uploads=MAX_UPLOADS_PER_DAY, youtube_services=youtube_services,
+            compress_for_telegram=compress_for_telegram, generation_lock=generation_lock,
+        )
+        register_auto_handlers(telegram_app, auto_studio, admin_only)
         await telegram_app.initialize()
         await telegram_app.start()
+        await auto_studio.start()
         await telegram_app.updater.start_polling(drop_pending_updates=True)
         scheduler_task = asyncio.create_task(scheduler_loop())
         production_worker_task = asyncio.create_task(production_worker_loop())
     yield
+    if auto_studio:
+        await auto_studio.stop()
+        auto_studio = None
     for task in (scheduler_task, production_worker_task):
         if not task:
             continue
@@ -1997,7 +2073,7 @@ app = FastAPI(title="Kids Haven Telegram & YouTube Studio", version="2.0.0", lif
 
 @app.get("/", include_in_schema=False)
 async def home():
-    return HTMLResponse("<html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Kids Haven Studio</title><body style='font:18px system-ui;max-width:720px;margin:50px auto;padding:20px'><h1>🌊 Kids Haven Studio</h1><p>بوت Telegram لإنشاء ومراجعة فيديوهات عربية وإنجليزية، مع ربط YouTube رسميًا.</p><p>اضبط أسرار Railway ثم ابدأ البوت بأمر /start. لا يتم نشر الفيديو تلقائيًا: يجب ضغط موافقة النشر في Telegram.</p><p><a href='/docs'>توثيق API</a> · <a href='/health'>حالة الخدمة</a></p></body></html>")
+    return HTMLResponse("<html lang='ar' dir='rtl'><meta charset='utf-8'><meta name='viewport' content='width=device-width'><title>Kids Haven Studio</title><body style='font:18px system-ui;max-width:720px;margin:50px auto;padding:20px'><h1>🌊 Kids Haven Studio</h1><p>بوت Telegram لإنشاء ومراجعة فيديوهات عربية وإنجليزية، مع ربط YouTube رسميًا.</p><p>مسار المراجعة يحتاج موافقة قبل النشر. أوامر الإنتاج التلقائي تنشر بعد تفعيلها صراحةً.</p><p><a href='/docs'>توثيق API</a> · <a href='/health'>حالة الخدمة</a></p></body></html>")
 
 
 @app.get("/health")

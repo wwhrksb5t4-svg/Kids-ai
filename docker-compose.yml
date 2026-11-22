@@ -1,0 +1,12 @@
+services:
+  kids-ai:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

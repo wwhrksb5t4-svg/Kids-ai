@@ -6,7 +6,7 @@ A bilingual Arabic/English children's story-video MVP operated from a private Te
 
 - Creates one Arabic and one English original episode per day at configured UTC times (defaults 12:00 and 14:00). Each script targets 300-360 spoken words; actual duration depends on narration speed. If the story is outside that range, the model is asked to revise it, up to three attempts.
 - Generates scripts with FastLLM, creates narrated vertical MP4 videos, and sends each to the configured Telegram admin for review. Optionally, Cloudflare Workers AI generates scene illustrations with a slow camera zoom. With `FASTLLM_MODEL=auto`, it prefers an available Grok text model.
-- Uploads to YouTube **only after the admin presses “Approve & publish”**. Published uploads are public and marked as made for kids (`selfDeclaredMadeForKids: true`).
+- The existing `/new` and `/today` flows upload to YouTube **only after admin approval**. The separate automatic nursery-rhyme flow below publishes when explicitly started via `/create` or enabled with `/auto_on`.
 - `/new` or the `/start` button accepts a user idea and offers story, educational, and adventure scripts; short or 2-3 minute duration; Arabic or English; and the configured primary or alternate voice. The bot sends a script and scene-outline preview first. Only after approving production does it render and send the video for a separate YouTube publish approval.
 - `/settings` switches among the configured content, image, video and song providers in Telegram; the dashboard offers the same persistent settings. Values saved there override environment defaults. Credentials are validated but never shown.
 - `/today` manually generates scheduled episodes; `/status` lists recent episodes; `/queue` shows persisted production jobs; `/pause ID`, `/resume ID` and `/stop ID` control approved idea-video jobs; `/cancel` cancels an unfinished `/new` setup; `/cost ID USD` records actual provider charges manually; `/stats` queries YouTube Analytics.
@@ -42,6 +42,25 @@ DAILY_EN_TIME=14:00
 # Optional: leave unset to rotate through 12 built-in themes
 # DAILY_TOPIC=
 ```
+
+## Automatic nursery-rhyme pipeline
+
+This is a separate, opt-in workflow; existing `/new`, `/today`, OAuth, dashboard, and review flows remain available. `/create TOPIC` queues an immediate job **that publishes automatically**. `/auto_on HOURS` enables periodic automatic publication; `/auto_off` stops future scheduled jobs and cancels queued automatic jobs. An upload already in flight may finish. The bot must be an administrator of the Telegram channel.
+
+1. Copy `.env.example` to `.env` for local use, and set `DATA_DIR=./data`. Set `BOT_TOKEN` (or the existing `TELEGRAM_BOT_TOKEN`), `ADMIN_IDS` as comma-separated numeric user IDs, `CHANNEL_ID`, `GEMINI_API_KEY`, and `MAX_UPLOADS_PER_DAY`. `GROQ_API_KEY` is an optional text fallback. Gemini and Groq account quotas and billing policies can change; free usage is not guaranteed. Never send keys to the bot.
+2. Set `PUBLIC_BASE_URL` to a reachable HTTPS URL and use the existing Google Web OAuth setup and `/connect`. Either configure `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, or set `YOUTUBE_CLIENT_SECRET` to the path of a Google **web client** JSON file. The OAuth token and generated character library are stored under `DATA_DIR`. Protect the directory and mount it persistently on Railway.
+3. Put music you have the right to use in `DATA_DIR/music`, or set `MUSIC_LIBRARY_PATH` to an existing folder such as `assets/music`. Supported formats include MP3 and WAV. Check each track's commercial-use and attribution requirements yourself.
+4. Install the dependencies with `pip install -r requirements.txt` and install FFmpeg/ffprobe. Run `uvicorn main:app --host 0.0.0.0 --port 8000`. Or run `docker compose up --build` after preparing `.env` and `data/`. The container uses CPU PyTorch unless configured with a compatible GPU runtime and drivers.
+5. In the private admin chat, use `/setlang ar`, `/setmusic library`, `/addtopic TOPIC`, and `/auto_on 24`; or use `/create TOPIC` for an immediate publication. `/queue` includes waiting topics; `/status` includes automatic jobs, errors, and today's automatic upload count. `/resume ID` retries a failed job when its publication state is safe to retry.
+6. `/characters`, `/newchar IDEA`, `/preview ID`, and `/delchar ID` manage the original character library. Changes persist in `DATA_DIR/characters.json`.
+
+The new workflow uses the locally downloaded `black-forest-labs/FLUX.1-schnell` image model, **not** Pollinations or paid image APIs. The 12-billion-parameter model requires a large download and substantial RAM/VRAM; CPU-only generation may be impractically slow. Access can require accepting model terms and an `HF_TOKEN`. Railway or Oracle Always Free may not have enough resources, and neither hosting nor provider free tiers are guaranteed. For Oracle Cloud Always Free, provision an eligible VM, open only required network ports, install Docker and Compose, copy the repository and `.env` securely, mount persistent storage, then run `docker compose up --build`; model and storage requirements must be checked against the actual VM limits.
+
+`MUSIC_MODE=library` is the default. `generate` uses local `facebook/musicgen-small`, and `auto` tries it before the library. MusicGen model weights are [CC-BY-NC-4.0](https://huggingface.co/facebook/musicgen-small), **not licensed for commercial use**. Generation is disabled unless `MUSICGEN_NONCOMMERCIAL_CONFIRMED=1`; only set it after checking that your intended use complies. `auto` uses the library when confirmation is absent. This system cannot establish copyright clearance for generated content or external music.
+
+The output is 1920×1080 with burned-in captions, but 1280×720 generated images are upscaled; Ken Burns is camera movement over still images, not character animation. Edge TTS speaks rather than sings the lyrics. Character descriptions and seeds improve repeatability but do not guarantee visual identity or original melodies. The originality guard checks known names and close spellings; it cannot detect all copyrighted similarities. Review the content and rights before using automatic publishing. The upload limit applies to this new automatic workflow; it does not count uploads made through the pre-existing manual workflow.
+
+Automatic jobs, settings, per-destination publication states, and quota reservations are saved in SQLite. On restart interrupted jobs are requeued and completed scene files reused. If an upload or Telegram send has an uncertain outcome, the job is stopped rather than automatically repeated: inspect the channel and YouTube first to avoid duplicate publication. Only files within a completed automatic job's work directory are removed.
 
 Optional: `BACKGROUND_MUSIC_PATH=/app/data/music/licensed-track.mp3` for music you have rights to use. Without this variable, the video has narration only.
 
@@ -94,7 +113,7 @@ Free option: `VIDEO_PROVIDER=hf` animates scenes through a public Hugging Face S
 
 ## Schedule and publishing
 
-Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. Set times appropriate for your audience. The scheduler generates a draft/video at those times, then sends it to Telegram. No video is automatically published without the explicit approval button.
+Schedule values use UTC in `HH:MM` format. Defaults are noon and 14:00 UTC. The existing daily scheduler sends drafts to Telegram and requires approval before publishing. The separate opt-in automatic workflow publishes without per-video approval.
 
 ## Web endpoints
 
