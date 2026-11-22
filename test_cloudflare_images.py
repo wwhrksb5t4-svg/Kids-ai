@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -31,15 +32,23 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
             "camera_angle": "low-angle medium shot",
             "character_ids": ["mimo"],
         }
+
+        async def generate_frame(prompt, path, size):
+            pixels = random.Random(42).randbytes(256 * 144 * 3)
+            Image.frombytes("RGB", (256, 144), pixels).save(path, format="PNG")
+
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(main.scene_images, "generate_image", new_callable=AsyncMock) as generate:
+             patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "test-account"), \
+             patch.object(main, "CLOUDFLARE_API_TOKEN", "test-token"), \
+             patch.object(main, "_cloudflare_frame", side_effect=generate_frame) as generate:
             await main.make_cloudflare_frame(scene, Path(directory) / "scene.png")
+        generate.assert_awaited_once()
         prompt = generate.await_args.args[0]
         self.assertIn("A small round lavender rabbit", prompt)
         self.assertIn("female", prompt)
         self.assertIn("a sunny seaside pier", prompt)
         self.assertIn("low-angle medium shot", prompt)
-        self.assertEqual(generate.await_args.kwargs["size"], (720, 1280))
+        self.assertEqual(generate.await_args.args[2], (720, 1280))
 
     async def test_scene_without_character_bible_ids_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
