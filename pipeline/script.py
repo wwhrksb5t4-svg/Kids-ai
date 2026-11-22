@@ -79,7 +79,7 @@ def _parse_json(text: str) -> object:
         raise ValueError("The model did not return valid JSON.") from exc
 
 
-def _validate_script(value: object, allowed_ids: set[str]) -> dict:
+def _validate_script(value: object, allowed_ids: set[str], character_by_id=None) -> dict:
     if not isinstance(value, dict):
         raise ValueError("Script must be a JSON object.")
     for field in ("title", "description"):
@@ -91,6 +91,7 @@ def _validate_script(value: object, allowed_ids: set[str]) -> dict:
     scenes = value.get("scenes")
     if not isinstance(scenes, list) or not 6 <= len(scenes) <= 8:
         raise ValueError("Script needs 6-8 scenes.")
+    locations, angles = set(), set()
     for index, scene in enumerate(scenes, 1):
         if not isinstance(scene, dict):
             raise ValueError(f"Scene {index} must be an object.")
@@ -107,9 +108,22 @@ def _validate_script(value: object, allowed_ids: set[str]) -> dict:
             raise ValueError(f"Scene {index} needs a lyric of at most two lines.")
         if any(not line.strip() for line in lyric.strip().splitlines()):
             raise ValueError(f"Scene {index} has an empty lyric line.")
+        if character_by_id:
+            for character_id in ids:
+                name = character_by_id[character_id]["name"]
+                if name.casefold() not in lyric.casefold():
+                    raise ValueError(f"Scene {index} lyric must name {name}.")
         visual = scene.get("visual_description")
         if not isinstance(visual, str) or not visual.strip():
             raise ValueError(f"Scene {index} needs a visual action.")
+        for field, unique_values in (("location", locations), ("camera_angle", angles)):
+            item = scene.get(field)
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"Scene {index} needs a distinct {field.replace('_', ' ')}.")
+            normalized = " ".join(item.casefold().split())
+            if normalized in unique_values:
+                raise ValueError(f"Every scene needs a different {field.replace('_', ' ')}.")
+            unique_values.add(normalized)
         duration = scene.get("duration")
         if type(duration) not in (int, float) or not math.isfinite(duration) or not 1 <= duration <= 60:
             raise ValueError(f"Scene {index} duration must be between 1 and 60 seconds.")
@@ -143,26 +157,33 @@ async def create_script(
         "both": "Write bilingual English and Arabic lyrics, title, and description.",
     }[language]
     choices = [
-        {key: character[key] for key in ("id", "name", "species", "personality")}
+        {key: character[key] for key in ("id", "name", "gender", "species", "personality")}
         for character in characters
     ]
     prompt = (
         "Write an original, safe nursery rhyme for toddlers. Never copy or imitate an existing "
         "brand, character, song, melody, or catchphrase. Use simple vocabulary, repetition, "
-        "gentle rhymes and a positive theme. "
+        "gentle rhymes and a positive theme. Use each character's exact name in every scene lyric "
+        "and keep pronouns and grammatical gender consistent with the character bible "
+        "(female characters use she/her; male characters use he/him). Give every scene a unique "
+        "location and camera angle. "
         f"{language_instruction}\n"
         f"Topic: {topic.strip()}\n"
         f"Available characters: {json.dumps(choices, ensure_ascii=False)}\n"
         "Return only a JSON object with title, description, tags (array of strings), and "
         "scenes (6-8 objects). Each scene must contain character_ids (array of available IDs), "
         "lyric (one or two short lines separated by a newline), visual_description "
-        "(English setting and action only; do not describe the characters' appearance), "
+        "(English action only; do not describe character appearance), location (specific setting, "
+        "unique across scenes), camera_angle (distinct framing and angle, unique across scenes), "
         "and duration (seconds, number from 1 to 60)."
     )
     last_error = None
     for attempt in range(1, 4):
         try:
-            script = _validate_script(_parse_json(await llm(prompt)), allowed_ids)
+            character_by_id = {character["id"]: character for character in characters}
+            script = _validate_script(
+                _parse_json(await llm(prompt)), allowed_ids, character_by_id
+            )
             check_originality(json.dumps(script, ensure_ascii=False))
             return script
         except ValueError as exc:

@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from pipeline import animation, characters, guard, images, music, publish, script, video, voice
 from pipeline.bot_commands import register_auto_handlers
@@ -45,9 +45,10 @@ class CharacterAndScriptTest(unittest.IsolatedAsyncioTestCase):
         response = {
             "title": "Counting together", "description": "Friends count blocks.", "tags": ["counting"],
             "scenes": [
-                {"character_ids": ["mimo"], "lyric": "Count and play\nAll the day",
-                 "visual_description": "Counting blocks in a garden.", "duration": 5}
-                for _ in range(6)
+                {"character_ids": ["mimo"], "lyric": f"Mimo counts {index}\nPlay all day",
+                 "visual_description": f"Counting blocks in a garden {index}.",
+                 "location": f"garden {index}", "camera_angle": f"angle {index}", "duration": 5}
+                for index in range(6)
             ],
         }
         llm = AsyncMock(side_effect=['["mimo","tavi"]', "invalid", json.dumps(response)])
@@ -96,6 +97,47 @@ class CharacterAndScriptTest(unittest.IsolatedAsyncioTestCase):
             result = await images._generate_once("same character prompt")
         self.assertEqual(result.size, images.SIZE)
         self.assertEqual(len(requests), 1)
+
+    async def test_cloudflare_failure_falls_back_to_pollinations(self):
+        image = Image.effect_noise(images.SIZE, 30).convert("RGB")
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32, "CLOUDFLARE_API_TOKEN": "token"}), \
+             patch.object(images, "_cloudflare_once", new=AsyncMock(side_effect=RuntimeError("quota"))), \
+             patch.object(images, "_pollinations_once", new=AsyncMock(return_value=image)) as pollinations:
+            output = await images.generate_image("Mimo at a new place", 45, Path(folder) / "scene.png")
+            self.assertTrue(output.is_file())
+        pollinations.assert_awaited_once()
+
+    async def test_pollinations_request_uses_unique_seed_and_requested_dimensions(self):
+        requests = []
+        artwork = Image.effect_noise((256, 144), 30).convert("RGB")
+        encoded = io.BytesIO()
+        artwork.save(encoded, format="PNG")
+        raw = encoded.getvalue()
+        client_class = httpx.AsyncClient
+
+        def respond(request):
+            requests.append(request)
+            self.assertEqual(request.url.host, "image.pollinations.ai")
+            self.assertEqual(request.url.params["width"], "1280")
+            self.assertEqual(request.url.params["height"], "720")
+            self.assertEqual(request.url.params["seed"], "321")
+            return httpx.Response(200, content=raw)
+
+        client = client_class(transport=httpx.MockTransport(respond))
+        with patch.object(images.httpx, "AsyncClient", return_value=client), \
+             patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "", "CLOUDFLARE_API_TOKEN": ""}):
+            result = await images._generate_once("unique place, overhead angle", seed=321)
+        self.assertEqual(result.size, images.SIZE)
+        self.assertEqual(len(requests), 1)
+
+    async def test_duplicate_ai_images_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            one, two = Path(folder) / "one.png", Path(folder) / "two.png"
+            Image.new("RGB", (256, 144), "red").save(one)
+            Image.new("RGB", (256, 144), "red").save(two)
+            with self.assertRaisesRegex(RuntimeError, "duplicate image"):
+                images.ensure_distinct_images([one, two])
 
     async def test_paid_animation_adapters_and_daily_guard(self):
         for provider, model in animation.FAL_MODELS.items():
@@ -384,8 +426,9 @@ class SchedulerAndPublishingTest(unittest.IsolatedAsyncioTestCase):
             story = {
                 "title": "Count", "description": "Count together", "tags": ["counting"],
                 "scenes": [
-                    {"character_ids": ["mimo"], "lyric": "Count and play", "visual_description": "Counting",
-                     "duration": 3} for _ in range(6)
+                    {"character_ids": ["mimo"], "lyric": f"Mimo count {index}", "visual_description": f"Counting {index}",
+                     "location": f"garden {index}", "camera_angle": f"angle {index}", "duration": 3}
+                    for index in range(6)
                 ],
             }
 
@@ -423,6 +466,41 @@ class SchedulerAndPublishingTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RenderingTest(unittest.IsolatedAsyncioTestCase):
+    async def test_video_subtitle_has_no_box_and_sits_in_lower_third(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "caption.png"
+            await asyncio.to_thread(video._text_image, "Mimo says hello", path)
+            with Image.open(path) as caption:
+                alpha = caption.getchannel("A")
+                bounds = alpha.getbbox()
+                self.assertEqual(alpha.getpixel((0, 0)), 0)
+                self.assertGreater(bounds[1], 800)
+                self.assertLess(bounds[3], 1080)
+
+    async def test_rembg_character_cutout_produces_parallax_layers(self):
+        source = Image.new("RGB", (256, 144), (60, 120, 180))
+        source_bytes = io.BytesIO()
+        source.save(source_bytes, format="PNG")
+        cutout = Image.new("RGBA", source.size, (0, 0, 0, 0))
+        ImageDraw.Draw(cutout).ellipse((80, 20, 180, 130), fill=(240, 80, 40, 255))
+        cutout_bytes = io.BytesIO()
+        cutout.save(cutout_bytes, format="PNG")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            image, background, foreground = root / "scene.png", root / "bg.png", root / "fg.png"
+            source.save(image)
+            with patch.object(video, "_REMBG_SESSION", None), \
+                 patch("rembg.new_session", return_value=object()) as new_session, \
+                 patch("rembg.remove", return_value=cutout_bytes.getvalue()) as remove:
+                await asyncio.to_thread(video._separate_character, image, background, foreground)
+            new_session.assert_called_once_with("u2net")
+            remove.assert_called_once()
+            with Image.open(foreground) as layer:
+                alpha = layer.getchannel("A")
+                self.assertGreater(alpha.getbbox()[2], 0)
+                self.assertLess(sum(alpha.getdata()) / (255 * 256 * 144), 0.5)
+            self.assertTrue(background.is_file())
+
     async def test_real_render_is_1080p(self):
         if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
             self.skipTest("FFmpeg is required")
@@ -436,7 +514,18 @@ class RenderingTest(unittest.IsolatedAsyncioTestCase):
                      "-i", f"sine=frequency=440:duration={seconds}", str(path)], check=True,
                 )
             story = {"title": "ألوان جميلة", "scenes": [{"lyric": "هيا نلعب", "duration": 1}]}
-            output, thumb = await video.render_video(story, [artwork], [audio], track, root)
+            def separate(image, background, foreground):
+                with Image.open(image) as source:
+                    rgb = source.convert("RGB")
+                    rgb.save(background)
+                    layer = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+                    layer.paste(rgb.crop((400, 180, 850, 600)), (400, 180))
+                    mask = Image.new("L", rgb.size, 0)
+                    ImageDraw.Draw(mask).ellipse((400, 180, 850, 600), fill=255)
+                    layer.putalpha(mask)
+                    layer.save(foreground)
+            with patch.object(video, "_separate_character", side_effect=separate):
+                output, thumb = await video.render_video(story, [artwork], [audio], track, root)
             dimensions = subprocess.run(
                 ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                  "stream=width,height", "-of", "csv=s=x:p=0", str(output)],
@@ -444,6 +533,7 @@ class RenderingTest(unittest.IsolatedAsyncioTestCase):
             ).stdout.strip()
             self.assertEqual(dimensions, "1920x1080")
             self.assertLess(thumb.stat().st_size, 2_000_000)
+            self.assertTrue((root / "parallax-v2-0.mp4").is_file())
             motion = root / "motion.mp4"
             subprocess.run(
                 ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24",

@@ -1,4 +1,4 @@
-"""Original kids-song studio: lyrics -> sung track -> 3D-style scenes -> 16:9 music video.
+"""Original kids-song studio: lyrics -> vocal track -> AI scenes -> 16:9 music video.
 
 Self-contained so main.py only wires it in. Provider-specific work (images, motion clips,
 fonts) is injected by the caller.
@@ -15,10 +15,12 @@ from pathlib import Path
 import edge_tts
 import httpx
 from PIL import Image, ImageDraw
+from pipeline.characters import DEFAULT_LIBRARY, load_characters
+from pipeline.images import ensure_distinct_images
 
 SIZE = (1280, 720)
 STYLE_3D = (
-    "glossy Pixar-style 3D render, adorable chubby characters with big expressive eyes, "
+    "glossy original 3D cartoon, adorable rounded characters with big expressive eyes, "
     "soft studio lighting, vibrant saturated colors, smooth toy-like textures, wide 16:9 composition, "
     "bright cheerful background, no text, no logos, original characters"
 )
@@ -30,22 +32,20 @@ SONG_TOPICS = (
     "clean up time", "learning shapes at the playground", "washing hands with bubbles", "a trip to the beach",
 )
 MUSIC_FALLBACK = "children's nursery rhyme, upbeat, bouncy, kids choir, glockenspiel, ukulele, 105 bpm, joyful, sing-along"
-BLENDER_ACTIONS = ("dance", "wave", "clap", "point")
-
-
-async def write_song(client, model, topic, language, avoid_titles=(), character_instruction=""):
+async def write_song(client, model, topic, language, avoid_titles=(), character_instruction="", character_path=DEFAULT_LIBRARY):
     name = "Arabic" if language == "ar" else "English"
     avoid = f" Do not reuse these earlier titles or ideas: {'; '.join(avoid_titles)}." if avoid_titles else ""
-    blender_direction = (
-        " For each section also return blender_action, exactly one of dance, wave, clap, point. "
-        "The available visuals are limited to: dance in a garden with a ball; wave near a playhouse; "
-        "clap in front of a rainbow; point toward colorful blocks. Choose the most suitable action for each section, "
-        "and vary the actions. These are the only things the animation can show: do not claim it depicts other actions or objects."
-        if character_instruction else ""
-    )
+    characters = load_characters(character_path)
+    bible = [
+        {key: character[key] for key in ("id", "name", "gender", "species", "fixed_visual_description")}
+        for character in characters
+    ]
     prompt = (
         f"Write an original sing-along children's song for ages 2-6 in {name}. Theme: {topic}.{avoid} "
-        f"Follow the structure of top nursery-rhyme channels: one cute recurring main character. {character_instruction} "
+        "Use 1-3 characters only from the provided character bible. Their names, gender, appearance, "
+        "clothes and colors are fixed. Include the exact character name in every section's lyrics and "
+        "use grammatically correct gendered wording. "
+        f"Character bible: {json.dumps(bible, ensure_ascii=False)}. {character_instruction} "
         "Use very simple AABB rhymes, "
         "4-7 words per line, a catchy chorus of 4 short lines that repeats 3 times word-for-word, and fun action words kids can copy. "
         "Total song: intro-free, 8 sections in this order: verse, chorus, verse, chorus, verse, chorus, verse, chorus "
@@ -53,12 +53,13 @@ async def write_song(client, model, topic, language, avoid_titles=(), character_
         "Never copy any existing song or franchise. Safe, gentle, positive. "
         "Return JSON with: title (catchy, under 70 characters, ending with ' | Kids Songs'), description (2-3 sentences for parents), "
         "tags (10 English and local-language search keywords), art_style (one English sentence), "
-        "characters (1-3 objects with name and appearance; appearance is a detailed English description), "
         "music_prompt (English comma-separated music style tags with bpm, instruments and 'kids choir'), "
         "and sections: 8 objects each with type ('verse' or 'chorus'), lines (4 strings in the song language), "
-        "visual_description (English, self-contained, names characters, place and action) and motion (one English sentence of character movement). "
-        "Chorus sections must use identical lines but different visual_description."
-        f"{blender_direction}"
+        "character_ids (array of character-bible IDs), location (specific setting, unique per section), "
+        "camera_angle (distinct framing and angle, unique per section), visual_description "
+        "(English action only; do not describe appearance) and motion (one English sentence of character movement). "
+        "Every section needs a different location and camera angle. Chorus sections must use identical lines "
+        "but distinct locations and camera angles."
     )
     system = "You are a kids music writer. Write original age-appropriate songs. Return valid JSON only."
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
@@ -72,7 +73,7 @@ async def write_song(client, model, topic, language, avoid_titles=(), character_
             response = await client.chat.completions.create(model=model, messages=messages)
         content = response.choices[0].message.content or "{}"
         song = _parse_json(content)
-        problem = _validate(song)
+        problem = _validate(song, characters)
         if not problem:
             return song
         last = problem
@@ -92,17 +93,41 @@ def _parse_json(text):
         return {}
 
 
-def _validate(song):
+def _validate(song, characters=None):
+    sections = song.get("sections")
+    if not isinstance(song, dict):
+        return "response must be a JSON object"
     sections = song.get("sections")
     if not isinstance(sections, list) or len(sections) < 6:
         return "need at least 6 sections"
     words = 0
-    for section in sections:
+    known = {item["id"]: item for item in (characters or load_characters())}
+    locations, angles = set(), set()
+    for index, section in enumerate(sections):
         lines = section.get("lines") if isinstance(section, dict) else None
         if not isinstance(lines, list) or not 2 <= len(lines) <= 6 or not all(str(x).strip() for x in lines):
             return "every section needs 2-6 non-empty lines"
         if not str(section.get("visual_description", "")).strip():
             return "every section needs a visual_description"
+        ids = section.get("character_ids")
+        if (
+            not isinstance(ids, list) or not ids
+            or any(not isinstance(item, str) or item not in known for item in ids)
+        ):
+            return "every section needs valid character_ids from the character bible"
+        lyric = " ".join(str(line) for line in lines).casefold()
+        for character_id in ids:
+            character = known[character_id]
+            if character["name"].casefold() not in lyric:
+                return f"section {index + 1} lyrics must name {character['name']} and use the correct gender"
+        for field, unique in (("location", locations), ("camera_angle", angles)):
+            value = section.get(field)
+            if not isinstance(value, str) or not value.strip():
+                return f"every section needs a {field}"
+            normalized = " ".join(value.casefold().split())
+            if normalized in unique:
+                return f"every section needs a different {field}"
+            unique.add(normalized)
         words += sum(len(str(x).split()) for x in lines)
     if not 90 <= words <= 230:
         return f"song has {words} words; it must have 110-170"
@@ -120,18 +145,11 @@ def normalize_sections(song, character_sheet):
             "visual_description": str(section["visual_description"]).strip(),
             "motion": str(section.get("motion", "")).strip(),
             "character_sheet": character_sheet,
-            "blender_action": str(section.get("blender_action", "")).strip().lower(),
+            "character_ids": list(section["character_ids"]),
+            "location": str(section["location"]).strip(),
+            "camera_angle": str(section["camera_angle"]).strip(),
         })
     return scenes
-
-
-def blender_action_indices(scenes):
-    return [
-        BLENDER_ACTIONS.index(scene["blender_action"])
-        if scene.get("blender_action") in BLENDER_ACTIONS
-        else index % len(BLENDER_ACTIONS)
-        for index, scene in enumerate(scenes)
-    ]
 
 
 def lyrics_text(scenes):
@@ -267,39 +285,41 @@ def make_lyric_image(text, language, path, font_fn, shape_fn):
     while face.getlength(shaped) > width - 80 and size > 30:
         size -= 4
         face = font_fn(size)
-    draw.rounded_rectangle((30, 10, width - 30, height - 10), radius=36, fill=(20, 10, 60, 150))
-    draw.text((width // 2, height // 2), shaped, font=face, fill=(255, 236, 90, 255), anchor="mm", stroke_width=4, stroke_fill=(60, 20, 120, 255))
+    draw.text(
+        (width // 2, height // 2), shaped, font=face, fill="white",
+        anchor="mm", stroke_width=6, stroke_fill="black",
+    )
     image.save(path)
 
 
-async def render_song_video(scenes, timings, song, language, job_dir, output, make_image, make_motion, font_fn, shape_fn, progress, prebuilt_motion=None, control=None):
+async def render_song_video(scenes, timings, song, language, job_dir, output, make_image, make_motion, font_fn, shape_fn, progress, control=None):
+    frames = [job_dir / f"artwork-v2-{index}.png" for index in range(len(scenes))]
+    for scene, frame in zip(scenes, frames):
+        if control:
+            await control()
+        if not frame.exists():
+            await make_image(scene, frame)
+    ensure_distinct_images(frames)
     clips = []
     for index, scene in enumerate(scenes):
         if control:
             await control()
         start, end, line_times = timings[index]
         duration = end - start
-        key = "chorus" if scene["type"] == "chorus" else index  # repeated chorus reuses one image/clip: saves quota and mirrors real kids songs
-        frame = job_dir / f"artwork-{key}.png"
-        if prebuilt_motion is None and not frame.exists():
-            await make_image(scene, frame)
-        motion = job_dir / f"motion-{key}.mp4"
-        if prebuilt_motion is not None:
-            motion = prebuilt_motion[index % len(prebuilt_motion)]
-        elif make_motion and not motion.exists():
-            try:
-                await make_motion(scene, frame, motion)
-            except Exception as exc:
-                print(f"Motion failed for scene {index+1}, using zoom: {exc}", flush=True)
+        frame = frames[index]
+        motion = job_dir / f"motion-v2-{index}.mp4"
+        if not motion.exists():
+            if make_motion:
+                await make_motion(scene, frame, motion, duration)
+            else:
+                from pipeline.video import make_parallax_clip
+
+                await make_parallax_clip(frame, motion, duration, size=SIZE, work_dir=job_dir)
+        if not motion.is_file() or motion.stat().st_size == 0:
+            raise RuntimeError(f"No animated clip was produced for song scene {index + 1}.")
         command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y"]
-        if motion.exists():
-            command += ["-stream_loop", "-1", "-i", str(motion)]
-            base = f"[0:v]scale={SIZE[0]}:{SIZE[1]},fps=24,setsar=1,format=yuv420p[base]"
-        else:
-            command += ["-loop", "1", "-framerate", "24", "-i", str(frame)]
-            zoom = "min(1.0+0.0006*on,1.18)" if index % 2 == 0 else "max(1.18-0.0006*on,1.0)"
-            base = (f"[0:v]scale=1920:1080,zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)+25*sin(on/24)':y='ih/2-(ih/zoom/2)':"
-                    f"d=1:s={SIZE[0]}x{SIZE[1]}:fps=24,setsar=1,format=yuv420p[base]")
+        command += ["-stream_loop", "-1", "-i", str(motion)]
+        base = f"[0:v]scale={SIZE[0]}:{SIZE[1]},fps=24,setsar=1,format=yuv420p[base]"
         graph, previous = [base], "base"
         for li, line in enumerate(scene["lines"]):
             image = job_dir / f"lyric-{index}-{li}.png"

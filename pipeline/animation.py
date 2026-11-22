@@ -22,7 +22,7 @@ FAL_MODELS = {
     "veo": "fal-ai/veo3.1/image-to-video",
 }
 FAL_PROVIDERS = frozenset((*FAL_MODELS, "fal"))
-VIDEO_PROVIDERS = frozenset((*FAL_PROVIDERS, "runway", "hf", "blender", "none"))
+VIDEO_PROVIDERS = frozenset((*FAL_PROVIDERS, "runway", "hf", "none"))
 _DEFAULT_COST_ESTIMATES = {
     "kling": 0.75,
     "hailuo": 0.25,
@@ -336,7 +336,7 @@ async def animate_scene(
     """Animate a scene with one paid API request and cache the normalized result."""
     if provider not in VIDEO_PROVIDERS:
         raise ValueError(f"Unsupported video provider: {provider}")
-    if provider in ("none", "hf", "blender"):
+    if provider in ("none", "hf"):
         raise ValueError(f"{provider} does not use this cloud animation adapter.")
     if destination.is_file() and destination.stat().st_size:
         return destination

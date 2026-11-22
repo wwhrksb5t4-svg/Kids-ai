@@ -1,8 +1,7 @@
-import base64
 import asyncio
-import io
 import json
 import os
+import random
 import shutil
 import sqlite3
 import subprocess
@@ -26,59 +25,37 @@ with patch.dict(os.environ, {"DATA_DIR": _data_dir.name}):
 
 
 class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
-    async def test_generate_scene_art(self):
-        image_bytes = io.BytesIO()
-        Image.new("RGB", (80, 80), "blue").save(image_bytes, format="PNG")
+    async def test_scene_prompt_uses_character_bible_and_distinct_shot_fields(self):
+        scene = {
+            "visual_description": "Mimo waves to a bird",
+            "location": "a sunny seaside pier",
+            "camera_angle": "low-angle medium shot",
+            "character_ids": ["mimo"],
+        }
 
-        def respond(request):
-            self.assertEqual(request.headers["Authorization"], "Bearer test-token")
-            body = json.loads(request.content)
-            self.assertEqual(set(body), {"prompt"})
-            self.assertIn("friendly turtle", body["prompt"])
-            return httpx.Response(200, json={
-                "success": True,
-                "result": {"image": base64.b64encode(image_bytes.getvalue()).decode()},
-            })
+        async def generate_frame(prompt, path, size):
+            pixels = random.Random(42).randbytes(256 * 144 * 3)
+            Image.frombytes("RGB", (256, 144), pixels).save(path, format="PNG")
 
-        transport = httpx.MockTransport(respond)
-        real_client = httpx.AsyncClient
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "scene.png"
-            with patch.object(main, "CLOUDFLARE_API_TOKEN", "test-token"), \
-                 patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "a" * 32), \
-                 patch.object(main.httpx, "AsyncClient", side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
-                await main.make_cloudflare_frame({"visual_description": "friendly turtle"}, path)
-            with Image.open(path) as image:
-                self.assertEqual(image.size, (720, 1280))
-            self.assertFalse(path.with_suffix(".tmp").exists())
-
-    async def test_failed_or_invalid_responses_are_reported(self):
-        real_client = httpx.AsyncClient
-        for response, message in (
-            (httpx.Response(429), "quota is exhausted"),
-            (httpx.Response(200, json={"success": True, "result": {"image": "not-base64"}}), "invalid image response"),
-            (httpx.Response(200, json={"success": False}), "no Cloudflare error code"),
-        ):
-            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
-                transport = httpx.MockTransport(lambda request: response)
-                path = Path(directory) / "scene.png"
-                with patch.object(main.httpx, "AsyncClient", side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        await main.make_cloudflare_frame({"visual_description": "turtle"}, path)
-                self.assertFalse(path.exists())
-
-    async def test_cloudflare_error_reports_code_not_provider_text(self):
-        response = httpx.Response(400, json={"success": False, "errors": [
-            {"code": 5007, "message": "secret provider detail"},
-        ]})
-        real_client = httpx.AsyncClient
-        transport = httpx.MockTransport(lambda request: response)
         with tempfile.TemporaryDirectory() as directory, \
-             patch.object(main.httpx, "AsyncClient", side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
-            with self.assertRaises(RuntimeError) as caught:
-                await main.make_cloudflare_frame({"visual_description": "turtle"}, Path(directory) / "scene.png")
-        self.assertIn("HTTP 400; Cloudflare error code: 5007", str(caught.exception))
-        self.assertNotIn("secret provider detail", str(caught.exception))
+             patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "test-account"), \
+             patch.object(main, "CLOUDFLARE_API_TOKEN", "test-token"), \
+             patch.object(main, "_cloudflare_frame", side_effect=generate_frame) as generate:
+            await main.make_cloudflare_frame(scene, Path(directory) / "scene.png")
+        generate.assert_awaited_once()
+        prompt = generate.await_args.args[0]
+        self.assertIn("A small round lavender rabbit", prompt)
+        self.assertIn("female", prompt)
+        self.assertIn("a sunny seaside pier", prompt)
+        self.assertIn("low-angle medium shot", prompt)
+        self.assertEqual(generate.await_args.args[2], (720, 1280))
+
+    async def test_scene_without_character_bible_ids_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "character bible"):
+                await main.make_cloudflare_frame(
+                    {"visual_description": "friendly turtle"}, Path(directory) / "scene.png"
+                )
 
     def test_cloudflare_validation_details_are_sanitized(self):
         response = httpx.Response(400, json={"errors": [
@@ -89,12 +66,11 @@ class CloudflareImagesTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private content", message)
         self.assertNotIn("seed", message)
 
-    def test_cloudflare_requires_credentials(self):
+    def test_pollinations_fallback_does_not_require_cloudflare_credentials(self):
         with patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
              patch.object(main, "CLOUDFLARE_ACCOUNT_ID", ""), \
              patch.object(main, "CLOUDFLARE_API_TOKEN", ""):
-            with self.assertRaisesRegex(RuntimeError, "CLOUDFLARE_ACCOUNT_ID"):
-                main.check_image_provider()
+            main.check_image_provider()
 
     async def test_generate_button_requires_admin(self):
         query = SimpleNamespace(data="generate:today", message=object(), answer=AsyncMock())
@@ -120,9 +96,12 @@ class StudioHelpersTest(unittest.TestCase):
             self.assertEqual(main.pick_topic(date(2026, 1, 1)), "my topic")
 
     def test_character_sheet_is_added_to_image_prompt(self):
-        sheet = main.character_sheet({"art_style": "watercolor", "characters": [{"name": "Lulu", "appearance": "blue fish with a red scarf"}]})
+        sheet = main.character_sheet({
+            "art_style": "watercolor",
+            "scenes": [{"character_ids": ["mimo"]}],
+        })
         self.assertIn("watercolor", sheet)
-        self.assertIn("Lulu: blue fish with a red scarf", sheet)
+        self.assertIn("Mimo (female): A small round lavender rabbit", sheet)
 
     def test_captions_cover_the_whole_narration_duration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -130,6 +109,15 @@ class StudioHelpersTest(unittest.TestCase):
             self.assertEqual(len(captions), 2)
             self.assertAlmostEqual(captions[-1][2], 10)
             self.assertTrue(all(path.exists() for path, _, _ in captions))
+
+    def test_story_subtitle_is_white_outlined_and_has_no_box(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, _, _ = main.make_caption_images("Mimo plays outside", "en", 2, Path(directory), 0)[0]
+            with Image.open(path) as caption:
+                colors = caption.getcolors(maxcolors=1_000_000)
+                self.assertEqual(caption.getpixel((0, 0))[3], 0)
+                self.assertTrue(any(color[:3] == (255, 255, 255) and color[3] for _, color in colors))
+                self.assertTrue(any(color[:3] == (0, 0, 0) and color[3] for _, color in colors))
 
     def test_caption_playlist_covers_different_line_heights(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -162,8 +150,14 @@ class StoryLengthTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def response(count, scenes=6):
         story = {"title": "A story", "scenes": [
-            {"narration": " ".join(["word"] * count)}
-            for _ in range(scenes)
+            {
+                "character_ids": ["mimo"],
+                "location": f"place {index}",
+                "camera_angle": f"angle {index}",
+                "visual_description": f"Mimo explores place {index}.",
+                "narration": "Mimo " + " ".join(["word"] * (count - 1)),
+            }
+            for index in range(scenes)
         ]}
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(story)))])
 
@@ -248,18 +242,17 @@ class StudioSettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "settings.sqlite3"
             with patch.object(main, "DB_PATH", path), \
-                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
+                 patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
                  patch.object(main, "VIDEO_PROVIDER", "none"), \
                  patch.object(main, "SONG_PROVIDER", "tts"), \
                  patch.object(main, "CONTENT_MODE", "story"):
                 main.init_db()
-                main.set_studio_settings({"image_provider": "cards", "content_mode": "story"})
+                main.set_studio_settings({"image_provider": "cloudflare", "content_mode": "story"})
                 main.load_studio_settings()
                 self.assertEqual(main.CONTENT_MODE, "story")
                 with patch.object(main, "CLOUDFLARE_ACCOUNT_ID", ""), patch.object(main, "CLOUDFLARE_API_TOKEN", ""):
-                    with self.assertRaisesRegex(ValueError, "Cloudflare غير جاهز"):
-                        main.set_studio_settings({"image_provider": "cloudflare"})
-                self.assertEqual(main.IMAGE_PROVIDER, "cards")
+                    main.set_studio_settings({"image_provider": "cloudflare"})
+                self.assertEqual(main.IMAGE_PROVIDER, "cloudflare")
 
     def test_selecting_video_apis_requires_their_credentials(self):
         values = {
@@ -284,14 +277,18 @@ class StudioSettingsTest(unittest.TestCase):
              patch.dict(os.environ, {"RUNWAY_API_KEY": "runway-token"}):
             self.assertEqual(main.validate_studio_settings(values), None)
 
-    def test_song_mode_rejects_unavailable_visual_pipeline(self):
+    def test_procedural_images_and_blender_are_rejected(self):
         values = {
             "image_provider": "cards",
             "video_provider": "none",
             "song_provider": "tts",
             "content_mode": "song",
         }
-        with self.assertRaisesRegex(ValueError, "وضع الأغاني يحتاج"):
+        with self.assertRaisesRegex(ValueError, "Cloudflare أو Pollinations"):
+            main.validate_studio_settings(values)
+        values["image_provider"] = "cloudflare"
+        values["video_provider"] = "blender"
+        with self.assertRaisesRegex(ValueError, "مزود الفيديو غير مدعوم"):
             main.validate_studio_settings(values)
 
 
@@ -396,9 +393,15 @@ class IdeaDraftTest(unittest.IsolatedAsyncioTestCase):
             "title": "Counting with a fox",
             "description": "A gentle lesson.",
             "art_style": "Colorful original 3D cartoon.",
-            "characters": [{"name": "Fifi", "appearance": "A small orange fox in a blue scarf."}],
             "scenes": [
-                {"narration": " ".join(["word"] * 40), "visual_description": f"Fifi counts blocks in scene {i}.", "motion": "Fifi points."}
+                {
+                    "character_ids": ["mimo"],
+                    "location": f"garden {i}",
+                    "camera_angle": f"angle {i}",
+                    "narration": "Mimo " + " ".join(["word"] * 39),
+                    "visual_description": f"Mimo counts blocks in scene {i}.",
+                    "motion": "Mimo points.",
+                }
                 for i in range(3)
             ],
         }
@@ -477,7 +480,7 @@ class IdeaDraftTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "resume.sqlite3"
             with patch.object(main, "DB_PATH", path), \
-                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
+                 patch.object(main, "IMAGE_PROVIDER", "cloudflare"), \
                  patch.object(main, "VIDEO_PROVIDER", "none"):
                 main.init_db()
                 with main.db() as con:
@@ -575,7 +578,7 @@ class ScenePipelineTest(unittest.IsolatedAsyncioTestCase):
             frame, audio = await main.prepare_scene(
                 {"narration": "hello"}, 0, 1, "en", "voice", Path(directory)
             )
-        self.assertEqual(frame.name, "artwork-0.png")
+        self.assertEqual(frame.name, "artwork-v2-0.png")
         self.assertEqual(audio.name, "voice-0.mp3")
 
 
@@ -744,63 +747,32 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
                 con.execute("DELETE FROM episodes WHERE id=?", (episode_id,))
 
 
-class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
-    async def test_song_writer_requests_supported_visual_actions(self):
+class SceneAnimationTest(unittest.IsolatedAsyncioTestCase):
+    def test_song_sections_require_bible_names_and_distinct_shots(self):
+        characters = main.load_characters()
         song = {"sections": [
-            {"lines": ["one two three four five"] * 3, "visual_description": "garden", "blender_action": "wave"}
-            for _ in range(6)
+            {
+                "lines": [
+                    "Mimo plays with colorful blocks",
+                    "Mimo counts with all of her friends",
+                    "Mimo smiles at the bright sun",
+                ],
+                "visual_description": f"Mimo explores place {index}",
+                "character_ids": ["mimo"],
+                "location": f"place {index}",
+                "camera_angle": f"angle {index}",
+            }
+            for index in range(6)
         ]}
-        create = AsyncMock(return_value=SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(song)))]
-        ))
-        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-        result = await main.song_studio.write_song(client, "model", "colors", "ar", character_instruction="original child")
-        self.assertIn("blender_action", create.await_args.kwargs["messages"][1]["content"])
-        self.assertEqual(main.song_studio.blender_action_indices(main.song_studio.normalize_sections(result, "")), [1] * 6)
+        self.assertEqual(main.song_studio._validate(song, characters), "")
+        song["sections"][1]["camera_angle"] = song["sections"][0]["camera_angle"]
+        self.assertIn("different camera_angle", main.song_studio._validate(song, characters))
+        song["sections"][1]["camera_angle"] = "new angle"
+        song["sections"][1]["lines"] = ["A friend plays", "A friend counts", "A friend smiles"]
+        self.assertIn("must name Mimo", main.song_studio._validate(song, characters))
 
-    async def test_old_animation_cache_is_replaced_and_new_cache_reused(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "blender-child-v3-0.mp4").write_bytes(b"old")
-
-            def render(command, **kwargs):
-                if command[0] == "ffmpeg":
-                    Path(command[-1]).write_bytes(b"new")
-                return SimpleNamespace(returncode=0, stderr="")
-
-            with patch.object(main, "DATA_DIR", path), \
-                 patch.object(main, "WORK_DIR", path), \
-                 patch.object(main.subprocess, "run", side_effect=render) as run:
-                first = await main.blender_animation(0)
-                second = await main.blender_animation(0)
-            self.assertEqual(first.read_bytes(), b"new")
-            self.assertEqual(second, first)
-            self.assertEqual(run.call_count, 2)
-
-    async def test_sections_choose_supported_actions_and_reuse_loops(self):
-        song = {"sections": [
-            {"lines": ["one", "two"], "visual_description": "garden", "blender_action": action}
-            for action in ("wave", "clap", "wave", "invalid")
-        ]}
-        scenes = main.song_studio.normalize_sections(song, "")
-        self.assertEqual(main.song_studio.blender_action_indices(scenes), [1, 2, 1, 3])
-        episode = {"id": "test", "language": "ar"}
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            async def animation(index):
-                return path / f"loop-{index}.mp4"
-            with patch.object(main, "VIDEO_PROVIDER", "blender"), \
-                 patch.object(main, "SONG_PROVIDER", "tts"), \
-                 patch.object(main, "db"), \
-                 patch.object(main, "blender_animation", side_effect=animation) as generate, \
-                 patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
-                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
-                 patch.object(main, "create_video_thumbnail"):
-                await main.render_song_episode(episode, scenes, {}, path)
-                self.assertEqual([call.args[0] for call in generate.await_args_list], [1, 2, 3])
-                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [
-                    path / "loop-1.mp4", path / "loop-2.mp4", path / "loop-1.mp4", path / "loop-3.mp4",
-                ])
+    def test_video_provider_no_longer_exposes_blender(self):
+        self.assertNotIn("blender", main.animation.VIDEO_PROVIDERS)
 
     async def test_arabic_lyric_uses_basic_font_layout(self):
         used = []
@@ -825,25 +797,6 @@ class BlenderModeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(create.await_count, 1)
         self.assertEqual(create.await_args.args[0], "ar")
         send.assert_awaited_once_with("test")
-
-    async def test_blender_song_does_not_request_cloudflare(self):
-        episode = {"id": "test", "language": "ar"}
-        scenes = [{"type": "verse", "lines": ["hello"]}]
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            with patch.object(main, "VIDEO_PROVIDER", "blender"), \
-                 patch.object(main, "IMAGE_PROVIDER", "cards"), \
-                 patch.object(main, "SONG_PROVIDER", "tts"), \
-                 patch.object(main, "db") as db, \
-                 patch.object(main, "blender_animation", new_callable=AsyncMock, return_value=path / "loop.mp4"), \
-                 patch.object(main.song_studio, "make_tts_song", new_callable=AsyncMock, return_value=(path / "song.m4a", [])), \
-                 patch.object(main.song_studio, "render_song_video", new_callable=AsyncMock) as render, \
-                 patch.object(main, "create_video_thumbnail"), \
-                 patch.object(main, "make_cloudflare_frame", new_callable=AsyncMock) as cloudflare:
-                await main.render_song_episode(episode, scenes, {}, path)
-                self.assertEqual(render.await_args.kwargs["prebuilt_motion"], [path / "loop.mp4"])
-                cloudflare.assert_not_awaited()
-
 
 if __name__ == "__main__":
     unittest.main()

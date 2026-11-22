@@ -177,7 +177,8 @@ def register_auto_handlers(application, studio, authorized):
                 existing = load_characters(studio.character_path)
                 prompt = (
                     "Create one original child-friendly cartoon character, never imitating any existing property. "
-                    "Return only JSON with id (lowercase letters, digits or hyphens), name, species, age_role, "
+                    "Return only JSON with id (lowercase letters, digits or hyphens), name, "
+                    "gender (female or male), species, age_role, "
                     "fixed_visual_description (precise colors, shape, eyes, clothing and one accessory), "
                     "personality, voice (a valid English Edge TTS voice), rate (e.g. -12%), "
                     "pitch (e.g. +5Hz), and seed (an integer from 0 to 4294967295). "
