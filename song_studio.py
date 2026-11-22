@@ -5,6 +5,7 @@ fonts) is injected by the caller.
 """
 import asyncio
 import json
+import logging
 import math
 import re
 import struct
@@ -32,10 +33,14 @@ SONG_TOPICS = (
     "clean up time", "learning shapes at the playground", "washing hands with bubbles", "a trip to the beach",
 )
 MUSIC_FALLBACK = "children's nursery rhyme, upbeat, bouncy, kids choir, glockenspiel, ukulele, 105 bpm, joyful, sing-along"
+logger = logging.getLogger(__name__)
+
+
 async def write_song(client, model, topic, language, avoid_titles=(), character_instruction="", character_path=DEFAULT_LIBRARY):
     name = "Arabic" if language == "ar" else "English"
     avoid = f" Do not reuse these earlier titles or ideas: {'; '.join(avoid_titles)}." if avoid_titles else ""
     characters = load_characters(character_path)
+    known = {character["id"]: character for character in characters}
     bible = [
         {key: character[key] for key in ("id", "name", "gender", "species", "fixed_visual_description")}
         for character in characters
@@ -43,8 +48,9 @@ async def write_song(client, model, topic, language, avoid_titles=(), character_
     prompt = (
         f"Write an original sing-along children's song for ages 2-6 in {name}. Theme: {topic}.{avoid} "
         "Use 1-3 characters only from the provided character bible. Their names, gender, appearance, "
-        "clothes and colors are fixed. Include the exact character name in every section's lyrics and "
-        "use grammatically correct gendered wording. "
+        "clothes and colors are fixed. Include each character's exact name in at least half of the "
+        "sections. Section 1 must name a character in its lyrics or the first line of its visual_description. "
+        "Use gender-consistent pronouns. "
         f"Character bible: {json.dumps(bible, ensure_ascii=False)}. {character_instruction} "
         "Use very simple AABB rhymes, "
         "4-7 words per line, a catchy chorus of 4 short lines that repeats 3 times word-for-word, and fun action words kids can copy. "
@@ -63,25 +69,80 @@ async def write_song(client, model, topic, language, avoid_titles=(), character_
     )
     system = "You are a kids music writer. Write original age-appropriate songs. Return valid JSON only."
     messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
-    last = ""
-    for _ in range(3):
+
+    async def request_song():
         try:
             response = await client.chat.completions.create(model=model, messages=messages, response_format={"type": "json_object"})
         except Exception as exc:
             if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
                 raise
             response = await client.chat.completions.create(model=model, messages=messages)
-        content = response.choices[0].message.content or "{}"
-        song = _parse_json(content)
-        problem = _validate(song, characters)
-        if not problem:
-            return song
-        last = problem
-        messages = messages[:2] + [
+        return response.choices[0].message.content or "{}"
+
+    def add_correction(content, problem):
+        messages.extend([
             {"role": "assistant", "content": content},
-            {"role": "user", "content": f"Problem: {problem}. Return the complete corrected JSON."},
-        ]
-    raise RuntimeError(f"AI could not write a valid song: {last}")
+            {
+                "role": "user",
+                "content": f"Your previous JSON failed: {problem}. Return the complete corrected JSON.",
+            },
+        ])
+
+    last_problem = ""
+    content = ""
+    song = {}
+    for _ in range(4):
+        content = await request_song()
+        song = _parse_json(content)
+        last_problem = _validate(song, characters, language)
+        if not last_problem:
+            return song
+        add_correction(content, last_problem)
+
+    sections = song.get("sections")
+    first_ids = (
+        sections[0].get("character_ids", [])
+        if isinstance(sections, list) and sections and isinstance(sections[0], dict)
+        else []
+    )
+    first_character = next(
+        (known[item] for item in first_ids if isinstance(item, str) and item in known),
+        characters[0] if characters else None,
+    )
+    if first_character:
+        sections = song.get("sections")
+        if isinstance(sections, list) and sections and isinstance(sections[0], dict):
+            lines = sections[0].get("lines")
+            if isinstance(lines, list) and lines:
+                lines[0] = f"{first_character['name']}, {str(lines[0]).strip()}"
+                logger.warning(
+                    "Automatically added %s to the first song lyric after four validation failures.",
+                    first_character["name"],
+                )
+                last_problem = _validate(song, characters, language)
+                if not last_problem:
+                    return song
+
+    for _ in range(4):
+        content = await request_song()
+        song = _parse_json(content)
+        sections = song.get("sections")
+        if first_character and isinstance(sections, list) and sections and isinstance(sections[0], dict):
+            lines = sections[0].get("lines")
+            if (
+                isinstance(lines, list) and lines
+                and first_character["name"].casefold() not in str(lines[0]).casefold()
+            ):
+                lines[0] = f"{first_character['name']}, {str(lines[0]).strip()}"
+                logger.warning(
+                    "Automatically added %s to the first song lyric after a corrective retry.",
+                    first_character["name"],
+                )
+        last_problem = _validate(song, characters, language)
+        if not last_problem:
+            return song
+        add_correction(content, last_problem)
+    raise RuntimeError(f"AI could not write a valid song: {last_problem}")
 
 
 def _parse_json(text):
@@ -93,8 +154,7 @@ def _parse_json(text):
         return {}
 
 
-def _validate(song, characters=None):
-    sections = song.get("sections")
+def _validate(song, characters=None, language="en"):
     if not isinstance(song, dict):
         return "response must be a JSON object"
     sections = song.get("sections")
@@ -103,6 +163,7 @@ def _validate(song, characters=None):
     words = 0
     known = {item["id"]: item for item in (characters or load_characters())}
     locations, angles = set(), set()
+    name_occurrences = {character_id: 0 for character_id in known}
     for index, section in enumerate(sections):
         lines = section.get("lines") if isinstance(section, dict) else None
         if not isinstance(lines, list) or not 2 <= len(lines) <= 6 or not all(str(x).strip() for x in lines):
@@ -116,10 +177,17 @@ def _validate(song, characters=None):
         ):
             return "every section needs valid character_ids from the character bible"
         lyric = " ".join(str(line) for line in lines).casefold()
+        visual_first_line = str(section.get("visual_description", "")).splitlines()[0].casefold()
         for character_id in ids:
             character = known[character_id]
-            if character["name"].casefold() not in lyric:
-                return f"section {index + 1} lyrics must name {character['name']} and use the correct gender"
+            character_name = character["name"].casefold()
+            if character_name in lyric or character_name in visual_first_line:
+                name_occurrences[character_id] += 1
+            gender_problem = _gender_pronoun_error(
+                lyric, character, language, index + 1
+            )
+            if gender_problem:
+                return gender_problem
         for field, unique in (("location", locations), ("camera_angle", angles)):
             value = section.get(field)
             if not isinstance(value, str) or not value.strip():
@@ -129,8 +197,49 @@ def _validate(song, characters=None):
                 return f"every section needs a different {field}"
             unique.add(normalized)
         words += sum(len(str(x).split()) for x in lines)
+    if sections[0].get("character_ids"):
+        first_ids = sections[0]["character_ids"]
+        first_lyric = " ".join(str(line) for line in sections[0]["lines"]).casefold()
+        first_visual_line = str(sections[0]["visual_description"]).splitlines()[0].casefold()
+        if not any(
+            known[character_id]["name"].casefold() in first_lyric
+            or known[character_id]["name"].casefold() in first_visual_line
+            for character_id in first_ids
+        ):
+            return "section 1 must name a character in its lyrics or first visual_description line"
+    required_mentions = math.ceil(len(sections) / 2)
+    for character_id, count in name_occurrences.items():
+        if count and count < required_mentions:
+            return (
+                f"character {known[character_id]['name']} must be named in at least "
+                f"half of the sections (at least {required_mentions})"
+            )
     if not 90 <= words <= 230:
         return f"song has {words} words; it must have 110-170"
+    return ""
+
+
+def _gender_pronoun_error(lyrics, character, language, section_number):
+    gender = character.get("gender")
+    if gender not in ("female", "male"):
+        return ""
+    if language == "ar":
+        wrong = (
+            (r"(?<![\w])هو(?![\w])|[\u0600-\u06FF]+ـه(?![\u0600-\u06FF])", "male")
+            if gender == "female"
+            else (r"(?<![\w])هي(?![\w])|[\u0600-\u06FF]+ـها(?![\u0600-\u06FF])", "female")
+        )
+    else:
+        wrong = (
+            (r"\b(?:he|his)\b", "male")
+            if gender == "female"
+            else (r"\b(?:she|her)\b", "female")
+        )
+    if re.search(wrong[0], lyrics, flags=re.IGNORECASE):
+        return (
+            f"section {section_number} uses explicit {wrong[1]} pronouns for "
+            f"{character['name']}, who is {gender}"
+        )
     return ""
 
 

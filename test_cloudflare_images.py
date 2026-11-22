@@ -748,7 +748,25 @@ class TelegramVideoTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SceneAnimationTest(unittest.IsolatedAsyncioTestCase):
-    def test_song_sections_require_bible_names_and_distinct_shots(self):
+    def song_with_names(self, named_sections=8, first_visual_name=False):
+        sections = []
+        for index in range(8):
+            lines = [
+                ("Mimo " if index < named_sections else "") + "shares the bright yellow ball",
+                "Friends are singing happy songs",
+                "Everyone dances together today",
+            ]
+            visual_name = "Mimo " if index == 0 and first_visual_name else ""
+            sections.append({
+                "lines": lines,
+                "visual_description": f"{visual_name}explores place {index}",
+                "character_ids": ["mimo"],
+                "location": f"place {index}",
+                "camera_angle": f"angle {index}",
+            })
+        return {"sections": sections}
+
+    def test_song_sections_allow_half_names_and_visual_name_in_first_section(self):
         characters = main.load_characters()
         song = {"sections": [
             {
@@ -769,7 +787,72 @@ class SceneAnimationTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("different camera_angle", main.song_studio._validate(song, characters))
         song["sections"][1]["camera_angle"] = "new angle"
         song["sections"][1]["lines"] = ["A friend plays", "A friend counts", "A friend smiles"]
-        self.assertIn("must name Mimo", main.song_studio._validate(song, characters))
+        self.assertEqual(main.song_studio._validate(song, characters), "")
+
+    def test_song_rejects_names_in_fewer_than_half_of_sections(self):
+        song = self.song_with_names(named_sections=3, first_visual_name=True)
+        self.assertIn("at least half", main.song_studio._validate(song, main.load_characters()))
+
+    def test_song_requires_character_name_in_first_section_lyrics_or_visual(self):
+        song = self.song_with_names(named_sections=4)
+        song["sections"][0]["lines"][0] = "Shares the bright yellow ball"
+        self.assertIn("section 1 must name", main.song_studio._validate(song, main.load_characters()))
+        song["sections"][0]["visual_description"] = "Mimo explores this place"
+        self.assertEqual(main.song_studio._validate(song, main.load_characters()), "")
+
+    def test_song_gender_checks_explicit_english_pronouns(self):
+        characters = main.load_characters()
+        song = self.song_with_names()
+        song["sections"][0]["lines"][1] = "He is happy today"
+        self.assertIn("explicit male pronouns", main.song_studio._validate(song, characters))
+        song["sections"][0]["lines"][1] = "She is happy today"
+        self.assertEqual(main.song_studio._validate(song, characters), "")
+
+    def test_arabic_song_accepts_gendered_verbs_and_checks_explicit_pronouns(self):
+        characters = main.load_characters()
+        song = self.song_with_names()
+        song["sections"][0]["lines"][1] = "Mimo ترقص قرب القمر"
+        self.assertEqual(main.song_studio._validate(song, characters, "ar"), "")
+        song["sections"][0]["lines"][1] = "Mimo هو سعيد"
+        self.assertIn("explicit male pronouns", main.song_studio._validate(song, characters, "ar"))
+
+    async def test_write_song_sends_validation_error_with_previous_reply(self):
+        invalid = self.song_with_names(named_sections=4)
+        invalid["sections"][0]["lines"][0] = "Shares the bright yellow ball"
+        invalid["sections"][0]["visual_description"] = "Explores place 0"
+        corrected = self.song_with_names(named_sections=4)
+        previous_reply = json.dumps(invalid)
+        completions = SimpleNamespace(create=AsyncMock(side_effect=[
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=previous_reply))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(corrected)))]),
+        ]))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        result = await main.song_studio.write_song(client, "test-model", "topic", "en")
+
+        self.assertEqual(main.song_studio._validate(result, main.load_characters()), "")
+        self.assertEqual(completions.create.await_count, 2)
+        retry_messages = completions.create.await_args_list[1].kwargs["messages"]
+        self.assertIn({"role": "assistant", "content": previous_reply}, retry_messages)
+        self.assertTrue(retry_messages[-1]["content"].startswith("Your previous JSON failed: "))
+        self.assertTrue(retry_messages[-1]["content"].endswith("Return the complete corrected JSON."))
+
+    async def test_write_song_repairs_first_lyric_after_four_failed_attempts(self):
+        invalid = self.song_with_names(named_sections=4)
+        invalid["sections"][0]["lines"][0] = "Shares the bright yellow ball"
+        invalid["sections"][0]["visual_description"] = "Explores place 0"
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(invalid)))]
+        )
+        completions = SimpleNamespace(create=AsyncMock(return_value=response))
+        client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+        with self.assertLogs("song_studio", level="WARNING"):
+            result = await main.song_studio.write_song(client, "test-model", "topic", "en")
+
+        self.assertEqual(completions.create.await_count, 4)
+        self.assertTrue(result["sections"][0]["lines"][0].startswith("Mimo, "))
+        self.assertEqual(main.song_studio._validate(result, main.load_characters()), "")
 
     def test_video_provider_no_longer_exposes_blender(self):
         self.assertNotIn("blender", main.animation.VIDEO_PROVIDERS)
