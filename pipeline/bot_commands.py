@@ -10,7 +10,7 @@ from pathlib import Path
 
 from telegram.ext import CommandHandler
 
-from pipeline import images, script
+from pipeline import animation, images, script
 from pipeline.characters import build_image_prompt, load_characters
 from pipeline.guard import check_originality
 
@@ -27,6 +27,13 @@ def register_auto_handlers(application, studio, authorized):
             raise ValueError("اضبط CHANNEL_ID أولاً وأضف البوت مديراً للقناة.")
         if not (os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GROQ_API_KEY", "").strip()):
             raise ValueError("اضبط GEMINI_API_KEY أو GROQ_API_KEY أولاً.")
+        if not (os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip() and os.getenv("CLOUDFLARE_API_TOKEN", "").strip()):
+            raise ValueError("اضبط CLOUDFLARE_ACCOUNT_ID وCLOUDFLARE_API_TOKEN لتوليد الصور.")
+        provider = studio.video_provider()
+        if provider in animation.FAL_PROVIDERS and not os.getenv("FAL_KEY", "").strip():
+            raise ValueError("اضبط FAL_KEY لمزوّد تحريك المشاهد المختار.")
+        if provider == "runway" and not os.getenv("RUNWAY_API_KEY", "").strip():
+            raise ValueError("اضبط RUNWAY_API_KEY لمزوّد Runway.")
         try:
             await asyncio.to_thread(studio.youtube_services)
         except Exception as exc:
@@ -50,6 +57,16 @@ def register_auto_handlers(application, studio, authorized):
             await update.message.reply_text(f"تم حفظ الموضوع للجدولة: {job_id}")
         except ValueError as exc:
             await update.message.reply_text(str(exc))
+
+    async def video_usage(update, context):
+        if not await require_admin(update):
+            return
+        used, limit, estimated, budget = animation.daily_usage_details(studio.db_path)
+        await update.message.reply_text(
+            f"استخدام تحريك الفيديو اليوم: {used}/{limit} مشهداً (UTC)، "
+            f"التكلفة المقدّرة ${estimated:.2f}/${budget:.2f}. "
+            "التكلفة الفعلية قد تختلف؛ هذا ليس سقف فاتورة مضموناً."
+        )
 
     async def auto_on(update, context):
         if not await require_admin(update):
@@ -224,6 +241,7 @@ def register_auto_handlers(application, studio, authorized):
     for name, handler in (
         ("create", create), ("addtopic", addtopic), ("auto_on", auto_on),
         ("auto_off", auto_off), ("setlang", setlang), ("setmusic", setmusic),
+        ("video_usage", video_usage),
         ("characters", characters), ("preview", preview), ("newchar", newchar), ("delchar", delchar),
     ):
         application.add_handler(CommandHandler(name, handler, block=False))

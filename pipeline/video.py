@@ -76,21 +76,35 @@ def _render_card(image: Path, output: Path, seconds: float) -> None:
     ])
 
 
-def _render_scene(image: Path, voice: Path, captions: Path, output: Path, duration: float) -> None:
+def _render_scene(
+    image: Path, voice: Path, captions: Path, output: Path, duration: float,
+    motion: Path | None = None,
+) -> None:
     fade_out = max(0, duration - 0.3)
+    if motion is None:
+        image_input = ["-loop", "1", "-framerate", "24", "-i", str(image)]
+        background = (
+            "[0:v]scale=2304:1296,zoompan=z='min(1+0.0004*on,1.12)':"
+            "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080:fps=24"
+        )
+    else:
+        image_input = ["-stream_loop", "-1", "-i", str(motion)]
+        background = (
+            "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,"
+            "crop=1920:1080,fps=24"
+        )
     filters = (
-        "[0:v]scale=2304:1296,zoompan=z='min(1+0.0004*on,1.12)':"
-        "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080:fps=24,"
-        f"setsar=1,fade=t=in:st=0:d=0.3,fade=t=out:st={fade_out:.3f}:d=0.3[bg];"
+        f"{background},setsar=1,fade=t=in:st=0:d=0.3,"
+        f"fade=t=out:st={fade_out:.3f}:d=0.3[bg];"
         "[bg][2:v]overlay=0:0:shortest=1,format=yuv420p[v]"
     )
-    _run([
-        "ffmpeg", "-v", "error", "-y", "-loop", "1", "-framerate", "24", "-i", str(image),
-        "-i", str(voice), "-loop", "1", "-framerate", "24", "-i", str(captions),
-        "-filter_complex", filters, "-map", "[v]", "-map", "1:a", "-af", "apad",
-        "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
-        "-ar", "44100", "-ac", "2", str(output),
-    ])
+    _run(
+        ["ffmpeg", "-v", "error", "-y", *image_input, "-i", str(voice),
+         "-loop", "1", "-framerate", "24", "-i", str(captions),
+         "-filter_complex", filters, "-map", "[v]", "-map", "1:a", "-af", "apad",
+         "-t", f"{duration:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac",
+         "-ar", "44100", "-ac", "2", str(output)]
+    )
 
 
 def _thumbnail(image: Path, title: str, destination: Path) -> None:
@@ -117,10 +131,13 @@ def _choose_thumbnail(images: list[Path]) -> Path:
 
 async def render_video(
     script: dict, images: list[Path], voices: list[Path], music: Path, job_dir: Path,
+    motions: list[Path | None] | None = None,
 ) -> tuple[Path, Path]:
     scenes = script["scenes"]
     if not scenes or len(images) != len(scenes) or len(voices) != len(scenes):
         raise ValueError("Every scene needs one image and one voice track.")
+    if motions is not None and len(motions) != len(scenes):
+        raise ValueError("Every scene must have exactly one motion entry.")
     job_dir = Path(job_dir)
     job_dir.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
@@ -135,7 +152,12 @@ async def render_video(
         await asyncio.to_thread(_text_image, scene["lyric"], caption)
         duration = max(float(scene["duration"]), await asyncio.to_thread(_duration, voices[index]) + 0.2)
         clip = job_dir / f"scene-{index}.mp4"
-        await asyncio.to_thread(_render_scene, images[index], voices[index], caption, clip, duration)
+        motion = motions[index] if motions else None
+        if motion is not None and (not Path(motion).is_file() or Path(motion).stat().st_size == 0):
+            raise ValueError(f"Motion clip for scene {index + 1} is missing or empty.")
+        await asyncio.to_thread(
+            _render_scene, images[index], voices[index], caption, clip, duration, motion
+        )
         clips.append(clip)
         total += duration
     outro = job_dir / "outro.png"

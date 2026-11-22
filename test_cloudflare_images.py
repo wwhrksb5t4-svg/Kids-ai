@@ -261,6 +261,29 @@ class StudioSettingsTest(unittest.TestCase):
                         main.set_studio_settings({"image_provider": "cloudflare"})
                 self.assertEqual(main.IMAGE_PROVIDER, "cards")
 
+    def test_selecting_video_apis_requires_their_credentials(self):
+        values = {
+            "image_provider": "cloudflare",
+            "video_provider": "kling",
+            "song_provider": "tts",
+            "content_mode": "story",
+        }
+        with patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "a" * 32), \
+             patch.object(main, "CLOUDFLARE_API_TOKEN", "cf-token"), \
+             patch.object(main, "FAL_KEY", ""):
+            with self.assertRaisesRegex(ValueError, "FAL_KEY"):
+                main.validate_studio_settings(values)
+        with patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "a" * 32), \
+             patch.object(main, "CLOUDFLARE_API_TOKEN", "cf-token"), \
+             patch.dict(os.environ, {"RUNWAY_API_KEY": ""}):
+            values["video_provider"] = "runway"
+            with self.assertRaisesRegex(ValueError, "RUNWAY_API_KEY"):
+                main.validate_studio_settings(values)
+        with patch.object(main, "CLOUDFLARE_ACCOUNT_ID", "a" * 32), \
+             patch.object(main, "CLOUDFLARE_API_TOKEN", "cf-token"), \
+             patch.dict(os.environ, {"RUNWAY_API_KEY": "runway-token"}):
+            self.assertEqual(main.validate_studio_settings(values), None)
+
     def test_song_mode_rejects_unavailable_visual_pipeline(self):
         values = {
             "image_provider": "cards",

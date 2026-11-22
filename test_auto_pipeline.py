@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import os
 import shutil
@@ -12,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from PIL import Image
 
-from pipeline import characters, guard, images, music, publish, script, video, voice
+from pipeline import animation, characters, guard, images, music, publish, script, video, voice
 from pipeline.bot_commands import register_auto_handlers
 from pipeline.scheduler import AutoStudio
 
@@ -60,20 +62,152 @@ class CharacterAndScriptTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             script._validate_script({"title": "x", "description": "x", "tags": ["x"], "scenes": []}, {"mimo"})
 
-    async def test_local_image_retries_blank_frame(self):
-        calls = []
-
-        def generate(prompt, seed):
-            calls.append(seed)
-            if len(calls) == 1:
-                return Image.new("RGB", images.SIZE, "white")
-            return Image.effect_noise(images.SIZE, 64).convert("RGB")
-
-        with tempfile.TemporaryDirectory() as folder, patch.object(images, "_generate_once", side_effect=generate):
+    async def test_cloud_image_retries_blank_frame(self):
+        blank = Image.new("RGB", images.SIZE, "white")
+        valid = Image.effect_noise(images.SIZE, 64).convert("RGB")
+        with tempfile.TemporaryDirectory() as folder, patch.object(
+            images, "_generate_once", new=AsyncMock(side_effect=[blank, valid])
+        ):
             output = await images.generate_image("original garden", 99, Path(folder) / "image.png")
-            self.assertEqual(calls, [99, 100])
             with Image.open(output) as image:
                 self.assertEqual(image.size, images.SIZE)
+
+    async def test_cloud_image_uses_remote_workers_ai(self):
+        requests = []
+        artwork = Image.effect_noise((256, 144), 30).convert("RGB")
+        encoded = io.BytesIO()
+        artwork.save(encoded, format="PNG")
+        encoded.seek(0)
+        raw = encoded.read()
+        encoded.close()
+        client_class = httpx.AsyncClient
+
+        def respond(request):
+            requests.append(request)
+            self.assertIn("/ai/run/@cf/black-forest-labs/flux-1-schnell", str(request.url))
+            self.assertEqual(json.loads(request.content), {"prompt": "same character prompt"})
+            return httpx.Response(200, json={
+                "success": True, "result": {"image": base64.b64encode(raw).decode()}
+            })
+
+        client = client_class(transport=httpx.MockTransport(respond))
+        with patch.object(images.httpx, "AsyncClient", return_value=client), \
+             patch.dict(os.environ, {"CLOUDFLARE_ACCOUNT_ID": "a" * 32, "CLOUDFLARE_API_TOKEN": "token"}):
+            result = await images._generate_once("same character prompt")
+        self.assertEqual(result.size, images.SIZE)
+        self.assertEqual(len(requests), 1)
+
+    async def test_paid_animation_adapters_and_daily_guard(self):
+        for provider, model in animation.FAL_MODELS.items():
+            endpoint, body = animation._fal_body(provider, "move", "data:image/png;base64,abc", True)
+            self.assertEqual(endpoint, model)
+            self.assertIn("prompt", body)
+            self.assertIn("image_url" if provider != "kling" else "start_image_url", body)
+        self.assertEqual(animation._fal_body("hailuo", "move", "data:image/png;base64,abc", True)[1]["duration"], "6")
+        self.assertEqual(animation._fal_body("pixverse", "move", "data:image/png;base64,abc", False)[1]["resolution"], "720p")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            artwork = root / "art.png"
+            Image.effect_noise((128, 128), 30).save(artwork)
+            destination = root / "motion.mp4"
+            with patch.dict(os.environ, {"FAL_KEY": "test-key", "VIDEO_API_MAX_SCENES_PER_DAY": "1"}), \
+                 patch.object(animation, "_fal_motion", new=AsyncMock(return_value=b"mp4")) as generate, \
+                 patch.object(animation, "_finalize"):
+                await animation.animate_scene(
+                    {"visual_description": "wave"}, artwork, destination,
+                    provider="kling", db_path=root / "db.sqlite3",
+                )
+                self.assertEqual(animation.daily_usage(root / "db.sqlite3"), (1, 1))
+                self.assertEqual(
+                    animation.daily_usage_details(root / "db.sqlite3"),
+                    (1, 1, 0.75, 10.0),
+                )
+                with self.assertRaisesRegex(RuntimeError, "Daily AI video limit"):
+                    await animation.animate_scene(
+                        {"visual_description": "wave"}, artwork, root / "second.mp4",
+                        provider="kling", db_path=root / "db.sqlite3",
+                    )
+            generate.assert_awaited_once()
+
+    async def test_daily_estimated_cost_guard_blocks_before_paid_request(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            artwork = root / "art.png"
+            Image.effect_noise((128, 128), 30).save(artwork)
+            with patch.dict(os.environ, {
+                "FAL_KEY": "test-key",
+                "VIDEO_API_MAX_SCENES_PER_DAY": "8",
+                "VIDEO_API_DAILY_BUDGET_USD": "1",
+                "VIDEO_ESTIMATED_COST_VEO_USD": "1.70",
+            }), patch.object(animation, "_fal_motion", new=AsyncMock()) as generate:
+                with self.assertRaisesRegex(RuntimeError, "Estimated AI video budget reached"):
+                    await animation.animate_scene(
+                        {"visual_description": "wave"}, artwork, root / "motion.mp4",
+                        provider="veo", db_path=root / "db.sqlite3",
+                    )
+            generate.assert_not_awaited()
+            self.assertEqual(animation.daily_usage(root / "db.sqlite3"), (0, 8))
+
+    async def test_fal_request_poll_and_download_use_documented_contract(self):
+        requests = []
+        client_class = httpx.AsyncClient
+
+        def respond(request):
+            requests.append(request)
+            if request.method == "POST":
+                self.assertEqual(request.url.path, "/fal-ai/minimax/hailuo-2.3-fast/standard/image-to-video")
+                body = json.loads(request.content)
+                self.assertEqual(body["duration"], "6")
+                self.assertTrue(body["image_url"].startswith("data:image/png;base64,"))
+                return httpx.Response(200, json={
+                    "status_url": "https://queue.fal.run/status/1",
+                    "response_url": "https://queue.fal.run/result/1",
+                })
+            if request.url.path == "/status/1":
+                return httpx.Response(200, json={"status": "COMPLETED"})
+            if request.url.path == "/result/1":
+                return httpx.Response(200, json={"video": {"url": "https://cdn.fal.media/output.mp4"}})
+            return httpx.Response(200, content=b"video-bytes")
+
+        client = client_class(transport=httpx.MockTransport(respond))
+        with tempfile.TemporaryDirectory() as folder:
+            artwork = Path(folder) / "image.png"
+            Image.effect_noise((128, 128), 30).save(artwork)
+            with patch.object(animation.httpx, "AsyncClient", return_value=client), \
+                 patch.dict(os.environ, {"FAL_KEY": "test-key"}):
+                result = await animation._fal_motion(
+                    "hailuo", "gentle movement", artwork, (1280, 720)
+                )
+        self.assertEqual(result, b"video-bytes")
+        self.assertEqual(len(requests), 4)
+
+    async def test_runway_uses_official_image_to_video_task_flow(self):
+        requests = []
+        client_class = httpx.AsyncClient
+
+        def respond(request):
+            requests.append(request)
+            if request.method == "POST":
+                self.assertEqual(request.url.host, "api.dev.runwayml.com")
+                body = json.loads(request.content)
+                self.assertEqual(body["model"], "gen4_turbo")
+                self.assertTrue(body["promptImage"].startswith("data:image/png;base64,"))
+                return httpx.Response(200, json={"id": "task-1"})
+            if request.url.path == "/v1/tasks/task-1":
+                return httpx.Response(200, json={
+                    "status": "SUCCEEDED", "output": ["https://cdn.runwayml.com/output.mp4"]
+                })
+            return httpx.Response(200, content=b"runway-video")
+
+        client = client_class(transport=httpx.MockTransport(respond))
+        with tempfile.TemporaryDirectory() as folder:
+            artwork = Path(folder) / "image.png"
+            Image.effect_noise((128, 128), 30).save(artwork)
+            with patch.object(animation.httpx, "AsyncClient", return_value=client), \
+                 patch.dict(os.environ, {"RUNWAY_API_KEY": "test-key"}):
+                result = await animation._runway_motion("gentle movement", artwork, (1280, 720))
+        self.assertEqual(result, b"runway-video")
+        self.assertEqual(len(requests), 3)
 
     async def test_music_library_and_automatic_fallback(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -120,7 +254,7 @@ class SchedulerAndPublishingTest(unittest.IsolatedAsyncioTestCase):
             db_path=root / "studio.sqlite3", data_dir=root, bot=SimpleNamespace(send_message=AsyncMock()),
             admin_ids=[123], channel_id="-1001", max_uploads=1,
             youtube_services=lambda: (None, None), compress_for_telegram=None,
-            generation_lock=asyncio.Lock(),
+            generation_lock=asyncio.Lock(), video_provider=lambda: "none",
         )
 
     async def test_pending_topics_and_recovery(self):
@@ -162,7 +296,7 @@ class SchedulerAndPublishingTest(unittest.IsolatedAsyncioTestCase):
             with studio.db() as con:
                 row = con.execute("SELECT topic,status FROM auto_jobs").fetchone()
             self.assertEqual(tuple(row), ("counting colors", "pending"))
-            self.assertTrue({"create", "auto_on", "auto_off", "characters", "preview", "newchar", "delchar"} <= commands.keys())
+            self.assertTrue({"create", "auto_on", "auto_off", "video_usage", "characters", "preview", "newchar", "delchar"} <= commands.keys())
 
     async def test_publication_is_not_duplicated_and_limit_is_enforced(self):
         class Request:
@@ -266,8 +400,9 @@ class SchedulerAndPublishingTest(unittest.IsolatedAsyncioTestCase):
                 path.write_bytes(b"music")
                 return path
 
-            async def render(story, pictures, voices, track, directory):
+            async def render(story, pictures, voices, track, directory, **kwargs):
                 self.assertEqual(len(pictures), 6)
+                self.assertEqual(kwargs["motions"], [None] * 6)
                 output, thumbnail = directory / "final.mp4", directory / "thumbnail.jpg"
                 output.write_bytes(b"video")
                 thumbnail.write_bytes(b"image")
@@ -309,6 +444,21 @@ class RenderingTest(unittest.IsolatedAsyncioTestCase):
             ).stdout.strip()
             self.assertEqual(dimensions, "1920x1080")
             self.assertLess(thumb.stat().st_size, 2_000_000)
+            motion = root / "motion.mp4"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24",
+                 "-t", "1", "-pix_fmt", "yuv420p", "-y", str(motion)],
+                check=True,
+            )
+            moving_output, _ = await video.render_video(
+                story, [artwork], [audio], track, root / "moving", motions=[motion]
+            )
+            moving_dimensions = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                 "stream=width,height", "-of", "csv=s=x:p=0", str(moving_output)],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(moving_dimensions, "1920x1080")
 
 
 if __name__ == "__main__":

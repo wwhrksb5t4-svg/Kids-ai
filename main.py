@@ -23,6 +23,7 @@ import arabic_reshaper
 import edge_tts
 import httpx
 import song_studio
+from pipeline import animation
 from bidi.algorithm import get_display
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -187,8 +188,8 @@ load_studio_settings()
 def validate_studio_settings(values):
     if values["image_provider"] not in ("cards", "cloudflare"):
         raise ValueError("مزود الصور يجب أن يكون cards أو cloudflare.")
-    if values["video_provider"] not in ("none", "fal", "hf", "blender"):
-        raise ValueError("مزود الفيديو يجب أن يكون none أو fal أو hf أو blender.")
+    if values["video_provider"] not in animation.VIDEO_PROVIDERS:
+        raise ValueError("مزود الفيديو غير مدعوم.")
     if values["song_provider"] not in ("tts", "fal"):
         raise ValueError("مزود الموسيقى يجب أن يكون tts أو fal.")
     if values["content_mode"] not in ("story", "song"):
@@ -197,12 +198,16 @@ def validate_studio_settings(values):
         re.fullmatch(r"[a-fA-F0-9]{32}", CLOUDFLARE_ACCOUNT_ID) and CLOUDFLARE_API_TOKEN
     ):
         raise ValueError("Cloudflare غير جاهز: أضف CLOUDFLARE_ACCOUNT_ID وCLOUDFLARE_API_TOKEN في Railway أولاً.")
-    if values["video_provider"] in ("fal", "hf") and values["image_provider"] != "cloudflare":
-        raise ValueError("تحريك fal وHugging Face يحتاج IMAGE_PROVIDER=cloudflare.")
+    if values["video_provider"] not in ("none", "blender") and values["image_provider"] != "cloudflare":
+        raise ValueError("تحريك المشاهد يحتاج IMAGE_PROVIDER=cloudflare.")
     if values["content_mode"] == "song" and values["image_provider"] != "cloudflare" and values["video_provider"] != "blender":
         raise ValueError("وضع الأغاني يحتاج IMAGE_PROVIDER=cloudflare أو VIDEO_PROVIDER=blender.")
-    if (values["video_provider"] == "fal" or values["song_provider"] == "fal") and not FAL_KEY:
-        raise ValueError("مزود fal يحتاج FAL_KEY في Railway.")
+    if values["video_provider"] in animation.FAL_PROVIDERS and not FAL_KEY:
+        raise ValueError("خدمات Kling وHailuo وPixVerse وVidu وDreamina وVeo عبر fal.ai تحتاج FAL_KEY في Railway.")
+    if values["video_provider"] == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
+        raise ValueError("Runway يحتاج RUNWAY_API_KEY في Railway.")
+    if values["song_provider"] == "fal" and not FAL_KEY:
+        raise ValueError("مزود fal للموسيقى يحتاج FAL_KEY في Railway.")
     if values["video_provider"] == "blender" and values["content_mode"] != "song":
         raise ValueError("Blender الحالي يدعم الأغاني فقط؛ اختر song قبل تفعيله.")
 
@@ -467,14 +472,16 @@ def make_frame(scene, path, index, total, language):
 
 
 def check_image_provider():
-    if VIDEO_PROVIDER not in ("none", "fal", "hf", "blender"):
-        raise RuntimeError(f"VIDEO_PROVIDER must be none, fal, hf or blender (got {VIDEO_PROVIDER!r}).")
+    if VIDEO_PROVIDER not in animation.VIDEO_PROVIDERS:
+        raise RuntimeError(f"Unsupported VIDEO_PROVIDER: {VIDEO_PROVIDER!r}.")
     if VIDEO_PROVIDER == "blender":
         return
-    if VIDEO_PROVIDER in ("fal", "hf") and IMAGE_PROVIDER != "cloudflare":
-        raise RuntimeError("VIDEO_PROVIDER=fal/hf requires IMAGE_PROVIDER=cloudflare.")
-    if VIDEO_PROVIDER == "fal" and not FAL_KEY:
-        raise RuntimeError("VIDEO_PROVIDER=fal requires FAL_KEY.")
+    if VIDEO_PROVIDER not in ("none",) and IMAGE_PROVIDER != "cloudflare":
+        raise RuntimeError("Image-to-video providers require IMAGE_PROVIDER=cloudflare.")
+    if VIDEO_PROVIDER in animation.FAL_PROVIDERS and not FAL_KEY:
+        raise RuntimeError("This video provider requires FAL_KEY.")
+    if VIDEO_PROVIDER == "runway" and not (os.getenv("RUNWAY_API_KEY") or "").strip():
+        raise RuntimeError("VIDEO_PROVIDER=runway requires RUNWAY_API_KEY.")
     if IMAGE_PROVIDER not in ("cards", "cloudflare"):
         raise RuntimeError("IMAGE_PROVIDER must be cards or cloudflare.")
     if IMAGE_PROVIDER == "cloudflare" and not (
@@ -579,41 +586,10 @@ async def _cloudflare_frame(scene, path, size=(720, 1280), style=""):
 
 
 async def make_fal_motion(scene, image_path, path, size=(720, 1280)):
-    """Animate a scene image into a short looping clip via fal.ai image-to-video."""
-    motion = str(scene.get("motion") or scene.get("visual_description") or "").strip()
-    prompt = (
-        "Smooth 3D animated children's cartoon, characters move gently and happily, subtle camera motion, "
-        "no text, no logos. " + str(scene.get("character_sheet", ""))[:500] + " Action: " + motion
-    )[:1500]
-    data_uri = "data:image/png;base64," + base64.b64encode(image_path.read_bytes()).decode()
-    headers = {"Authorization": f"Key {FAL_KEY}"}
-    body = {"prompt": prompt, "image_url": data_uri, "duration": "5", "aspect_ratio": "16:9" if size[0] > size[1] else "9:16"}
-    try:
-        async with httpx.AsyncClient(timeout=120) as http:
-            submit = await http.post(f"https://queue.fal.run/{FAL_VIDEO_MODEL}", headers=headers, json=body)
-            submit.raise_for_status()
-            job = submit.json()
-            deadline = asyncio.get_running_loop().time() + 600
-            while True:
-                status = (await http.get(job["status_url"], headers=headers)).json()
-                if status.get("status") == "COMPLETED":
-                    break
-                if status.get("status") not in ("IN_QUEUE", "IN_PROGRESS"):
-                    raise RuntimeError(f"fal.ai video generation failed: {str(status)[:300]}")
-                if asyncio.get_running_loop().time() > deadline:
-                    raise RuntimeError("fal.ai video generation timed out.")
-                await asyncio.sleep(5)
-            result = await http.get(job["response_url"], headers=headers)
-            result.raise_for_status()
-            video = await http.get(result.json()["video"]["url"])
-            video.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        raise RuntimeError(f"fal.ai request failed (HTTP {exc.response.status_code}): {exc.response.text[:300]}") from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError("Could not reach fal.ai; try again.") from exc
-    except (KeyError, ValueError, TypeError) as exc:
-        raise RuntimeError("fal.ai returned an unexpected response.") from exc
-    await finalize_motion(video.content, path, size)
+    """Animate a scene with the selected hosted API, then normalize it for FFmpeg."""
+    await animation.animate_scene(
+        scene, image_path, path, provider=VIDEO_PROVIDER, size=size, db_path=DB_PATH
+    )
 
 
 async def finalize_motion(raw_bytes, path, size=(720, 1280)):
@@ -800,8 +776,9 @@ async def prepare_scene(scene, index, total, language, voice, job_dir):
             else:
                 await asyncio.to_thread(make_frame, scene, frame, index, total, language)
         if IMAGE_PROVIDER == "cloudflare":
-            if VIDEO_PROVIDER == "fal" and not motion.exists():
-                await make_fal_motion(scene, frame, motion)
+            if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
+                if not motion.exists():
+                    await make_fal_motion(scene, frame, motion)
             elif VIDEO_PROVIDER == "hf" and not motion.exists():
                 try:
                     await make_hf_motion(scene, frame, motion)
@@ -904,7 +881,7 @@ async def render_song_episode(episode, scenes, meta, job_dir, control=None):
 
     motion = None
     prebuilt_motion = None
-    if VIDEO_PROVIDER == "fal":
+    if VIDEO_PROVIDER in animation.FAL_PROVIDERS or VIDEO_PROVIDER == "runway":
         motion = lambda scene, frame, path: make_fal_motion(scene, frame, path, song_studio.SIZE)
     elif VIDEO_PROVIDER == "hf":
         motion = lambda scene, frame, path: make_hf_motion(scene, frame, path, song_studio.SIZE)
@@ -1020,7 +997,7 @@ async def render_video(episode_id: str):
         temporary_clip = job_dir / f"clip-{index}.tmp.mp4"
         with db() as con:
             con.execute("UPDATE episodes SET render_progress=?,updated_at=? WHERE id=?", (int(index*90/len(scenes)), utc_now().isoformat(), episode_id))
-        use_motion = VIDEO_PROVIDER in ("fal", "hf") and (job_dir / f"motion-{index}.mp4").exists()
+        use_motion = VIDEO_PROVIDER in (*animation.FAL_PROVIDERS, "runway", "hf") and (job_dir / f"motion-{index}.mp4").exists()
         if use_motion:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostats", "-y", "-stream_loop", "-1", "-i", str(job_dir / f"motion-{index}.mp4"), "-i", str(audio)]
         else:
@@ -1445,7 +1422,7 @@ async def tg_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("غير مصرح. هذا البوت خاص بمدير القناة.")
         return
     await update.message.reply_text(
-        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو بمراجعة قبل النشر\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/create TOPIC — إنتاج ونشر تلقائي\n/auto_on HOURS — تفعيل الجدولة التلقائية\n/auto_off — إيقاف الجدولة\n/queue — الطابور\n/status — الحالة\n/stats — إحصاءات YouTube\n\nمسار /new و/today يحتاج موافقتك للنشر؛ /create و/auto_on ينشران تلقائياً.",
+        "أهلًا بك في Kids Haven Studio.\n/new — إنشاء فيديو بمراجعة قبل النشر\n/connect — ربط قناة YouTube\n/today — إنشاء حلقات اليوم\n/create TOPIC — إنتاج ونشر تلقائي\n/auto_on HOURS — تفعيل الجدولة التلقائية\n/auto_off — إيقاف الجدولة\n/queue — الطابور\n/status — الحالة\n/video_usage — استهلاك تحريك الفيديو اليومي\n/stats — إحصاءات YouTube\n\nمسار /new و/today يحتاج موافقتك للنشر؛ /create و/auto_on ينشران تلقائياً.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✨ إنشاء فيديو من فكرة", callback_data="idea:new")],
             [InlineKeyboardButton("🎬 إنشاء حلقات اليوم", callback_data="generate:today")],
@@ -1457,12 +1434,24 @@ def settings_keyboard():
     options = [
         ("نوع المحتوى", "content_mode", [("قصص", "story"), ("أغاني", "song")]),
         ("الصور", "image_provider", [("بطاقات", "cards"), ("Cloudflare AI", "cloudflare")]),
-        ("الفيديو", "video_provider", [("بدون تحريك", "none"), ("fal.ai", "fal"), ("Hugging Face", "hf"), ("Blender", "blender")]),
+        ("الفيديو", "video_provider", [
+            ("بدون تحريك", "none"), ("Kling عبر fal.ai", "kling"), ("Hailuo عبر fal.ai", "hailuo"),
+            ("PixVerse عبر fal.ai", "pixverse"), ("Vidu عبر fal.ai", "vidu"),
+            ("Seedance عبر fal.ai", "dreamina"), ("Runway API", "runway"),
+            ("Google Veo عبر fal.ai", "veo"), ("fal.ai مخصص", "fal"),
+            ("Hugging Face", "hf"), ("Blender", "blender"),
+        ]),
         ("الموسيقى", "song_provider", [("TTS وإيقاع", "tts"), ("غناء fal.ai", "fal")]),
     ]
     rows = []
     for label, key, values in options:
-        rows.append([InlineKeyboardButton(f"{label}: {name}", callback_data=f"settings:{key}:{value}") for name, value in values])
+        for start in range(0, len(values), 2):
+            rows.append([
+                InlineKeyboardButton(
+                    f"{label}: {name}", callback_data=f"settings:{key}:{value}"
+                )
+                for name, value in values[start:start + 2]
+            ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2042,6 +2031,7 @@ async def lifespan(app: FastAPI):
             db_path=DB_PATH, data_dir=DATA_DIR, bot=telegram_app.bot, admin_ids=admins,
             channel_id=CHANNEL_ID, max_uploads=MAX_UPLOADS_PER_DAY, youtube_services=youtube_services,
             compress_for_telegram=compress_for_telegram, generation_lock=generation_lock,
+            video_provider=lambda: VIDEO_PROVIDER,
         )
         register_auto_handlers(telegram_app, auto_studio, admin_only)
         await telegram_app.initialize()
@@ -2253,7 +2243,7 @@ function el(t,text,cls){const e=document.createElement(t);e.textContent=text;if(
 async function api(p){const r=await fetch(p,{headers:{'x-api-key':sessionStorage.getItem('k')||''}});if(!r.ok)throw new Error(r.status);return r.json()}
 async function post(p,body){const r=await fetch(p,{method:'POST',headers:{'x-api-key':sessionStorage.getItem('k')||'','Content-Type':'application/json'},body:JSON.stringify(body||{})});const j=await r.json();if(!r.ok)throw new Error(j.detail||r.status);return j}
 function rows(t,head,data){t.replaceChildren();const h=document.createElement('tr');head.forEach(x=>h.append(el('th',x)));t.append(h);data.forEach(r=>{const tr=document.createElement('tr');r.forEach(c=>{const td=document.createElement('td');if(c instanceof Node)td.append(c);else td.textContent=c??'';tr.append(td)});t.append(tr)})}
-const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['fal','fal.ai'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
+const providerOptions={content_mode:[['story','قصص'],['song','أغاني']],image_provider:[['cards','بطاقات'],['cloudflare','Cloudflare AI']],video_provider:[['none','بدون تحريك'],['kling','Kling via fal.ai'],['hailuo','Hailuo via fal.ai'],['pixverse','PixVerse via fal.ai'],['vidu','Vidu via fal.ai'],['dreamina','Seedance via fal.ai'],['runway','Runway API'],['veo','Google Veo via fal.ai'],['fal','fal.ai custom'],['hf','Hugging Face'],['blender','Blender']],song_provider:[['tts','TTS'],['fal','غناء fal.ai']]};
 function drawProviders(settings){const c=$('providerControls');c.replaceChildren();for(const [key,label] of [['content_mode','نوع المحتوى'],['image_provider','الصور'],['video_provider','الفيديو'],['song_provider','الموسيقى']]){const wrap=document.createElement('label');wrap.append(el('div',label));const s=document.createElement('select');s.dataset.setting=key;for(const [value,name] of providerOptions[key]){const o=document.createElement('option');o.value=value;o.textContent=name;s.append(o)}s.value=settings[key];wrap.append(s);c.append(wrap)}}
 async function saveProviders(){const payload={};document.querySelectorAll('[data-setting]').forEach(x=>payload[x.dataset.setting]=x.value);try{const r=await post('/studio/settings',payload);$('providerMsg').textContent='تم الحفظ';drawProviders(r.settings);load()}catch(e){$('providerMsg').textContent=e.message}}
 async function jobAction(id,action){try{await post('/studio/queue/'+encodeURIComponent(id)+'/'+action,{});load()}catch(e){$('genmsg').textContent=e.message}}

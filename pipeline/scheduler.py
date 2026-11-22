@@ -12,7 +12,7 @@ from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from pipeline import images, music, publish, script, voice, video
+from pipeline import animation, images, music, publish, script, voice, video
 from pipeline.characters import DEFAULT_LIBRARY, build_image_prompt, get_seed
 from pipeline.guard import check_originality
 
@@ -26,7 +26,7 @@ def _now():
 
 class AutoStudio:
     def __init__(self, *, db_path, data_dir, bot, admin_ids, channel_id, max_uploads,
-                 youtube_services, compress_for_telegram, generation_lock):
+                 youtube_services, compress_for_telegram, generation_lock, video_provider=None):
         self.db_path = Path(db_path)
         self.data_dir = Path(data_dir)
         self.bot = bot
@@ -36,6 +36,7 @@ class AutoStudio:
         self.youtube_services = youtube_services
         self.compress_for_telegram = compress_for_telegram
         self.generation_lock = generation_lock
+        self.video_provider = video_provider or (lambda: os.getenv("VIDEO_PROVIDER", "none"))
         self.character_path = self.data_dir / "characters.json"
         self.work_dir = self.data_dir / "auto-work"
         self.music_dir = Path(os.getenv("MUSIC_LIBRARY_PATH") or self.data_dir / "music")
@@ -202,25 +203,46 @@ class AutoStudio:
                     temporary.write_text(json.dumps(story, ensure_ascii=False), encoding="utf-8")
                     temporary.replace(script_path)
                 language = job["language"] or "ar"
-                pictures, voices = [], []
+                pictures, voices, motions = [], [], []
+                provider = self.video_provider()
                 for index, scene in enumerate(story["scenes"]):
                     await self.notify(f"المهمة {job['id']}: الصورة والصوت للمشهد {index + 1}/{len(story['scenes'])}.")
                     picture = directory / f"picture-{index}.png"
                     audio = directory / f"voice-{index}.mp3"
+                    motion = directory / f"motion-{index}.mp4"
                     if not picture.is_file():
                         prompt = build_image_prompt(scene["visual_description"], scene["character_ids"], path=self.character_path)
                         await images.generate_image(prompt, get_seed(scene["character_ids"][0], path=self.character_path), picture)
                     if not audio.is_file():
                         await voice.generate_voice(scene, language, audio, character_path=self.character_path)
+                    if provider not in ("none", "hf", "blender") and not motion.is_file():
+                        await self.notify(f"المهمة {job['id']}: تحريك المشهد {index + 1}/{len(story['scenes'])} عبر {provider}.")
+                        await animation.animate_scene(
+                            scene, picture, motion, provider=provider, db_path=self.db_path
+                        )
+                    elif provider == "hf" and not motion.is_file():
+                        from main import make_hf_motion
+
+                        await make_hf_motion(scene, picture, motion)
+                    elif provider == "blender":
+                        raise RuntimeError("Blender loops are not available in the automatic nursery pipeline.")
                     pictures.append(picture)
                     voices.append(audio)
+                    motions.append(motion if motion.is_file() else None)
                 await self.notify(f"المهمة {job['id']}: تجهيز الموسيقى والمونتاج.")
                 mode = job["music_mode"] or "library"
                 track = await music.get_music(mode, self.music_dir, directory)
                 story["music_generated"] = track.parent == directory
-                output, thumbnail = await video.render_video(story, pictures, voices, track, directory)
+                output, thumbnail = await video.render_video(
+                    story, pictures, voices, track, directory, motions=motions
+                )
                 if job["origin"] == "auto" and self.setting("auto_enabled", "0") != "1":
                     raise RuntimeError("تم إيقاف التشغيل التلقائي قبل النشر.")
+                used, limit, estimated, budget = animation.daily_usage_details(self.db_path)
+                await self.notify(
+                    f"استخدام تحريك المشاهد اليوم: {used}/{limit}، "
+                    f"التكلفة المقدّرة ${estimated:.2f}/${budget:.2f} (UTC)."
+                )
                 await self.notify(f"المهمة {job['id']}: إرسال الفيديو ورفعه إلى YouTube.")
                 youtube, _ = self.youtube_services()
                 url = await publish.publish(
